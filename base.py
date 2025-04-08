@@ -1,3 +1,5 @@
+import os
+import tempfile
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -5,6 +7,17 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from transformers import AutoProcessor, AutoModelForVision2Seq, CLIPImageProcessor
 import numpy as np
+
+# Create a temporary directory in the user's home directory
+temp_dir = os.path.join(os.path.expanduser("~"), "temp")
+os.makedirs(temp_dir, exist_ok=True)
+os.environ["TMPDIR"] = temp_dir
+os.environ["TEMP"] = temp_dir
+os.environ["TMP"] = temp_dir
+
+# Set the cache directory for Hugging Face to a location with sufficient space
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(os.path.expanduser("~"), "hf_cache")
+os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
 
 def download_cifar10():
     """Download CIFAR-10 dataset and return the train loader."""
@@ -75,9 +88,9 @@ def load_external_image(image_path="owl.png"):
         return load_single_image(trainloader)
 
 def load_vlm_model():
-    """Load a smaller VLM model that requires less disk space."""
-    # Use a much smaller model (about 1GB)
-    model_path = "Salesforce/blip-image-captioning-base"
+    """Load the BLIP-2 model for better image captioning."""
+    # Use BLIP-2 with OPT-2.7B
+    model_path = "Salesforce/blip2-opt-2.7b"
     processor = AutoProcessor.from_pretrained(model_path)
     
     # Load the model with float16 precision to save memory
@@ -132,8 +145,14 @@ def display_image_with_descriptions(image, class_name, descriptions, save_path="
         print("-" * 50)
 
 def main():
-    # Load the external image
-    image, label = load_external_image("owl.png")
+    # Download CIFAR-10 and get a dataloader
+    trainloader, classes = download_cifar10()
+    
+    # Load a single image from CIFAR-10
+    image, label = load_single_image(trainloader)
+    
+    # Get the class name
+    class_name = classes[label]
     
     # Load the VLM model
     model, processor = load_vlm_model()
@@ -142,7 +161,7 @@ def main():
     descriptions = generate_image_descriptions(model, processor, image)
     
     # Display results
-    display_image_with_descriptions(image, label, descriptions)
+    display_image_with_descriptions(image, class_name, descriptions)
 
 if __name__ == "__main__":
     main()
