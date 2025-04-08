@@ -5,7 +5,7 @@ import torchvision
 import torchvision.transforms as transforms
 from PIL import Image
 import matplotlib.pyplot as plt
-from transformers import AutoProcessor, AutoModelForVision2Seq, CLIPImageProcessor
+from transformers import AutoProcessor, AutoModelForImageTextToText
 import numpy as np
 
 # Create a temporary directory in the user's home directory
@@ -88,33 +88,21 @@ def load_external_image(image_path="owl.png"):
         return load_single_image(trainloader)
 
 def load_vlm_model():
-    """Load a more advanced vision-language model for detailed image descriptions."""
-    # Use LLaVA or similar model that's better at detailed descriptions
-    model_path = "llava-hf/llava-1.5-7b-hf"
+    """Load SmolVLM 2 model for detailed image descriptions."""
+    model_path = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
     
     processor = AutoProcessor.from_pretrained(model_path)
-    
-    # Load the model with float16 precision to save memory
-    model = AutoModelForVision2Seq.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
-    )
-    
-    # Move to GPU
-    model = model.to("cuda")
+        torch_dtype=torch.float16,  # Using float16 instead of bfloat16 for wider compatibility
+    ).to("cuda")
     
     return model, processor
 
 def generate_image_descriptions(model, processor, image, num_descriptions=3):
-    """Generate detailed descriptions about the image using a VLM."""
+    """Generate detailed descriptions about the image using SmolVLM 2."""
     # Save the image being passed to the model for debugging
     image.save("model_input_image.png")
-    
-    # Resize the image to a size that the model expects
-    # LLaVA typically expects images of at least 224x224
-    if image.size[0] < 224 or image.size[1] < 224:
-        image = image.resize((224, 224), Image.LANCZOS)
-        print(f"Resized image to: {image.size}")
     
     # Define prompts for different types of descriptions
     prompts = [
@@ -127,26 +115,47 @@ def generate_image_descriptions(model, processor, image, num_descriptions=3):
     
     # Process the image and generate descriptions for each prompt
     for prompt in prompts[:num_descriptions]:
-        # Properly format the input for LLaVA
-        inputs = processor(text=prompt, images=image, return_tensors="pt").to("cuda")
-        
-        # Generate with the model
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=150,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-            )
-        
-        # Decode the output
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        # Remove the prompt from the response if it's included
-        if prompt in generated_text:
-            generated_text = generated_text.replace(prompt, "").strip()
-        
-        descriptions.append(generated_text)
+        try:
+            # Format messages for SmolVLM 2
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": prompt},
+                    ]
+                },
+            ]
+            
+            # Apply chat template
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(model.device, dtype=torch.float16)
+            
+            # Generate with the model
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs, 
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    max_new_tokens=150
+                )
+            
+            # Decode the output
+            generated_text = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+            )[0]
+            
+            descriptions.append(generated_text)
+        except Exception as e:
+            print(f"Error generating description: {e}")
+            descriptions.append(f"Failed to generate description: {e}")
     
     return descriptions
 
