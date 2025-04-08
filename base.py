@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from transformers import AutoProcessor, AutoModelForImageTextToText
 import numpy as np
 import json
+import random
+from tqdm import tqdm
 
 # Create a temporary directory in the user's home directory
 temp_dir = os.path.join(os.path.expanduser("~"), "temp")
@@ -63,30 +65,6 @@ def load_single_image(trainloader):
     pil_image.save("original_image.png")
     
     return pil_image, labels[0].item()
-
-def load_external_image(image_path="owl.png"):
-    """Load an external image file."""
-    try:
-        # Load the image using PIL
-        image = Image.open(image_path)
-        
-        # Convert RGBA to RGB if needed
-        if image.mode == 'RGBA':
-            image = image.convert('RGB')
-            
-        print(f"Successfully loaded image: {image_path}")
-        print(f"Image size: {image.size}, Mode: {image.mode}")
-        
-        # Save a copy for debugging
-        image.save("loaded_image.png")
-        
-        return image, "external image"  # Return the image and a placeholder label
-    except Exception as e:
-        print(f"Error loading image {image_path}: {e}")
-        # If there's an error, fall back to CIFAR-10
-        print("Falling back to CIFAR-10 image")
-        trainloader, _ = download_cifar10()
-        return load_single_image(trainloader)
 
 def load_vlm_model():
     """Load SmolVLM 2 model for detailed image descriptions."""
@@ -310,38 +288,107 @@ def display_image_with_descriptions(image, class_name, descriptions, save_path="
             print(f"{i}. {desc}")
         print("-" * 50)
 
+def save_dataset(output_dir, data_list, split_ratio=0.9):
+    """Save the dataset in a format suitable for training."""
+    # Create directories
+    os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+    
+    # Shuffle data
+    random.shuffle(data_list)
+    
+    # Split into train/val
+    split_idx = int(len(data_list) * split_ratio)
+    train_data = data_list[:split_idx]
+    val_data = data_list[split_idx:]
+    
+    # Save train and val JSON files
+    with open(os.path.join(output_dir, "train.json"), 'w') as f:
+        json.dump(train_data, f, indent=2)
+    
+    with open(os.path.join(output_dir, "val.json"), 'w') as f:
+        json.dump(val_data, f, indent=2)
+    
+    # Create metadata
+    metadata = {
+        "dataset_name": "CIFAR10-VLM",
+        "num_images": len(data_list),
+        "num_train": len(train_data),
+        "num_val": len(val_data),
+        "classes": ["airplane", "automobile", "bird", "cat", "deer", 
+                   "dog", "frog", "horse", "ship", "truck"]
+    }
+    
+    with open(os.path.join(output_dir, "metadata.json"), 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Dataset saved to {output_dir}")
+    print(f"Train samples: {len(train_data)}")
+    print(f"Val samples: {len(val_data)}")
+
 def main():
     # Download CIFAR-10 and get a dataloader
+    print("Downloading CIFAR-10 dataset...")
     trainloader, classes = download_cifar10()
     
     # Create output directory
-    output_dir = "cifar10_llava_dataset"
+    output_dir = "cifar10_vlm_dataset"
     os.makedirs(output_dir, exist_ok=True)
     
     # Load the VLM model
+    print("Loading SmolVLM 2 model...")
     model, processor = load_vlm_model()
+    print("Model loaded successfully!")
+    
+    # Store all data entries
+    all_data = []
     
     # Process CIFAR-10 images
-    for i in range(5):  # Process 5 images
+    num_images = 11  # Aim for 1000+ images for a decent dataset
+    
+    # Create a tqdm progress bar
+    pbar = tqdm(range(num_images), desc="Processing CIFAR-10 images", unit="image")
+    
+    for i in pbar:
         try:
             # Get a single image
             image, label = load_single_image(trainloader)
             class_name = classes[label]
             
-            print(f"\nProcessing CIFAR-10 image {i+1}/5, class: {class_name}")
+            # Update progress bar description with current class
+            pbar.set_description(f"Processing {class_name} ({i+1}/{num_images})")
             
-            # Generate conversation data
+            # Generate conversation data (silently)
             conversation = generate_conversation_data(model, processor, image, class_name)
             
-            # Save the conversation
-            json_file = save_conversation_to_file(image, class_name, conversation, i, output_dir)
-            print(f"Saved conversation data to {json_file}")
+            # Save image
+            image_filename = f"images/{class_name}_{i}.png"
+            image_path = os.path.join(output_dir, image_filename)
+            os.makedirs(os.path.dirname(image_path), exist_ok=True)
+            image.save(image_path)
             
-            # Display each image and its conversation
-            display_image_with_descriptions(image, class_name, conversation)
+            # Format for training
+            formatted_conversation = []
+            for entry in conversation:
+                formatted_conversation.append({"from": "human", "value": entry["human"]})
+                formatted_conversation.append({"from": "assistant", "value": entry["assistant"]})
+            
+            # Add to dataset
+            all_data.append({
+                "image": image_filename,
+                "conversations": formatted_conversation
+            })
+            
+            # Save progress every 10 images
+            if (i+1) % 10 == 0:
+                save_dataset(output_dir, all_data)
                 
         except Exception as e:
-            print(f"Error processing CIFAR-10 image {i}: {e}")
+            # Log errors but continue processing
+            pbar.write(f"Error processing image {i}: {str(e)}")
+    
+    # Final save
+    save_dataset(output_dir, all_data)
+    print("Dataset generation complete!")
 
 if __name__ == "__main__":
     main()
