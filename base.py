@@ -343,7 +343,7 @@ def main():
     all_data = []
     
     # Process CIFAR-10 images
-    num_images = 11  # Aim for 1000+ images for a decent dataset
+    num_images = 10000  # Aim for 1000+ images for a decent dataset
     
     # Create a tqdm progress bar
     pbar = tqdm(range(num_images), desc="Processing CIFAR-10 images", unit="image")
@@ -379,7 +379,7 @@ def main():
             })
             
             # Save progress every 10 images
-            if (i+1) % 10 == 0:
+            if (i+1) % 500 == 0:
                 save_dataset(output_dir, all_data)
                 
         except Exception as e:
