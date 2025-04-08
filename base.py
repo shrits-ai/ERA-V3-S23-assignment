@@ -7,6 +7,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from transformers import AutoProcessor, AutoModelForImageTextToText
 import numpy as np
+import json
 
 # Create a temporary directory in the user's home directory
 temp_dir = os.path.join(os.path.expanduser("~"), "temp")
@@ -99,65 +100,192 @@ def load_vlm_model():
     
     return model, processor
 
-def generate_image_descriptions(model, processor, image, num_descriptions=3):
-    """Generate detailed descriptions about the image using SmolVLM 2."""
+def generate_conversation_data(model, processor, image, class_name):
+    """Generate conversational data similar to LLaVA-Instruct-150k for the given image."""
     # Save the image being passed to the model for debugging
     image.save("model_input_image.png")
     
-    # Define prompts for different types of descriptions
-    prompts = [
-        "Describe this image in detail.",
-        "What are the key elements in this picture?",
-        "What is happening in this image?"
-    ]
+    # Define conversation templates based on image type/class
+    conversation_templates = {
+        # Basic identification questions
+        "identification": [
+            "What is in this image?",
+            "Can you describe what you see in this image?",
+            "What objects are present in this image?"
+        ],
+        # Detailed description questions
+        "description": [
+            "What are the key elements in this picture?",
+            "Describe this image in detail.",
+            "What is the main subject of this image?"
+        ],
+        # Reasoning questions
+        "reasoning": [
+            "Why might the subject of this image be in this environment?",
+            "What is unusual or interesting about this image?",
+            "What can you infer about the context of this image?"
+        ]
+    }
     
-    descriptions = []
+    # Create a conversation structure
+    conversation = []
     
-    # Process the image and generate descriptions for each prompt
-    for prompt in prompts[:num_descriptions]:
-        try:
-            # Format messages for SmolVLM 2
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt},
+    # Add all questions from each category
+    for category, questions in conversation_templates.items():
+        for question in questions:  # Use all questions in each category
+            try:
+                print(f"Processing question: {question}")  # Debug print
+                
+                # Format messages for SmolVLM 2
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": question},
+                        ]
+                    },
+                ]
+                
+                # Apply chat template
+                inputs = processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                ).to(model.device, dtype=torch.float16)
+                
+                # Generate with the model
+                with torch.no_grad():
+                    generated_ids = model.generate(
+                        **inputs, 
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                        max_new_tokens=300
+                    )
+                
+                # Decode the output
+                answer = processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                )[0]
+                
+                # Clean up the answer - remove any "User:" or "Assistant:" prefixes
+                if "User:" in answer:
+                    answer = answer.split("User:")[-1].strip()
+                if "Assistant:" in answer:
+                    answer = answer.split("Assistant:")[-1].strip()
+                
+                # Add to conversation
+                conversation.append({
+                    "human": question,
+                    "assistant": answer
+                })
+                
+                # For reasoning questions, add a follow-up based on the answer
+                if category == "reasoning":
+                    follow_up = "Can you elaborate more on the characteristics you've described?"
+                    
+                    # Format messages for follow-up, including previous context
+                    follow_up_messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": image},
+                                {"type": "text", "text": question},
+                            ]
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": answer}]
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": follow_up}]
+                        }
                     ]
-                },
-            ]
-            
-            # Apply chat template
-            inputs = processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            ).to(model.device, dtype=torch.float16)
-            
-            # Generate with the model
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs, 
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    max_new_tokens=150
-                )
-            
-            # Decode the output
-            generated_text = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True,
-            )[0]
-            
-            descriptions.append(generated_text)
-        except Exception as e:
-            print(f"Error generating description: {e}")
-            descriptions.append(f"Failed to generate description: {e}")
+                    
+                    # Apply chat template for follow-up
+                    follow_up_inputs = processor.apply_chat_template(
+                        follow_up_messages,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt",
+                    ).to(model.device, dtype=torch.float16)
+                    
+                    # Generate follow-up response
+                    with torch.no_grad():
+                        follow_up_ids = model.generate(
+                            **follow_up_inputs, 
+                            do_sample=True,
+                            temperature=0.7,
+                            top_p=0.9,
+                            max_new_tokens=300
+                        )
+                    
+                    # Decode the follow-up output
+                    follow_up_answer = processor.batch_decode(
+                        follow_up_ids,
+                        skip_special_tokens=True,
+                    )[0]
+                    
+                    # Clean up the follow-up answer
+                    if "User:" in follow_up_answer:
+                        follow_up_answer = follow_up_answer.split("User:")[-1].strip()
+                    if "Assistant:" in follow_up_answer:
+                        follow_up_answer = follow_up_answer.split("Assistant:")[-1].strip()
+                    
+                    # Remove any duplicated content
+                    if question in follow_up_answer:
+                        parts = follow_up_answer.split(answer)
+                        if len(parts) > 1:
+                            follow_up_answer = parts[-1].strip()
+                    
+                    if follow_up in follow_up_answer:
+                        parts = follow_up_answer.split(follow_up)
+                        if len(parts) > 1:
+                            follow_up_answer = parts[-1].strip()
+                    
+                    # Add follow-up to conversation
+                    conversation.append({
+                        "human": follow_up,
+                        "assistant": follow_up_answer
+                    })
+                
+            except Exception as e:
+                print(f"Error generating conversation for question '{question}': {e}")
+                conversation.append({
+                    "human": question,
+                    "assistant": f"I apologize, but I couldn't analyze this image properly."
+                })
     
-    return descriptions
+    return conversation
+
+def save_conversation_to_file(image, class_name, conversation, index, output_dir="llava_dataset"):
+    """Save the conversation data to a file in a format similar to LLaVA-Instruct-150k."""
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save the image
+    image_filename = f"{output_dir}/image_{index}_{class_name}.png"
+    image.save(image_filename)
+    
+    # Format the conversation data
+    conversation_data = {
+        "image": image_filename,
+        "class": class_name,
+        "conversations": conversation
+    }
+    
+    # Save as JSON
+    json_filename = f"{output_dir}/conversation_{index}_{class_name}.json"
+    with open(json_filename, 'w') as f:
+        json.dump(conversation_data, f, indent=2)
+    
+    return json_filename
 
 def display_image_with_descriptions(image, class_name, descriptions, save_path="output_image.png"):
     """Display the image and its descriptions, with options for headless environments."""
@@ -173,29 +301,47 @@ def display_image_with_descriptions(image, class_name, descriptions, save_path="
     print(f"Image class: {class_name}")
     print("\nImage Descriptions:")
     for i, desc in enumerate(descriptions, 1):
-        print(f"{i}. {desc}")
+        if isinstance(desc, dict):
+            # If it's a dictionary with human/assistant keys
+            print(f"{i}. Human: {desc.get('human', '')}")
+            print(f"   Assistant: {desc.get('assistant', '')}")
+        else:
+            # If it's just a string
+            print(f"{i}. {desc}")
         print("-" * 50)
 
 def main():
     # Download CIFAR-10 and get a dataloader
     trainloader, classes = download_cifar10()
     
-    # Try to load an external image first
-    try:
-        image, class_name = load_external_image("sample_image.jpg")  # Update with your image path
-    except:
-        # Fall back to CIFAR-10 if external image fails
-        image, label = load_single_image(trainloader)
-        class_name = classes[label]
+    # Create output directory
+    output_dir = "cifar10_llava_dataset"
+    os.makedirs(output_dir, exist_ok=True)
     
     # Load the VLM model
     model, processor = load_vlm_model()
     
-    # Generate descriptions
-    descriptions = generate_image_descriptions(model, processor, image, num_descriptions=3)
-    
-    # Display results
-    display_image_with_descriptions(image, class_name, descriptions)
+    # Process CIFAR-10 images
+    for i in range(5):  # Process 5 images
+        try:
+            # Get a single image
+            image, label = load_single_image(trainloader)
+            class_name = classes[label]
+            
+            print(f"\nProcessing CIFAR-10 image {i+1}/5, class: {class_name}")
+            
+            # Generate conversation data
+            conversation = generate_conversation_data(model, processor, image, class_name)
+            
+            # Save the conversation
+            json_file = save_conversation_to_file(image, class_name, conversation, i, output_dir)
+            print(f"Saved conversation data to {json_file}")
+            
+            # Display each image and its conversation
+            display_image_with_descriptions(image, class_name, conversation)
+                
+        except Exception as e:
+            print(f"Error processing CIFAR-10 image {i}: {e}")
 
 if __name__ == "__main__":
     main()
