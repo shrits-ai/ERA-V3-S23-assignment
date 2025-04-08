@@ -88,9 +88,10 @@ def load_external_image(image_path="owl.png"):
         return load_single_image(trainloader)
 
 def load_vlm_model():
-    """Load the BLIP-2 model for better image captioning."""
-    # Use BLIP-2 with OPT-2.7B
-    model_path = "Salesforce/blip2-opt-2.7b"
+    """Load a more advanced vision-language model for detailed image descriptions."""
+    # Use LLaVA or similar model that's better at detailed descriptions
+    model_path = "llava-hf/llava-1.5-7b-hf"
+    
     processor = AutoProcessor.from_pretrained(model_path)
     
     # Load the model with float16 precision to save memory
@@ -104,28 +105,50 @@ def load_vlm_model():
     
     return model, processor
 
-def generate_image_descriptions(model, processor, image, num_descriptions=1):
-    """Generate a description about the image using BLIP-2."""
+def generate_image_descriptions(model, processor, image, num_descriptions=3):
+    """Generate detailed descriptions about the image using a VLM."""
     # Save the image being passed to the model for debugging
     image.save("model_input_image.png")
     
-    # Process the image and generate a caption
-    inputs = processor(images=image, return_tensors="pt").to("cuda")
+    # Resize the image to a size that the model expects
+    # LLaVA typically expects images of at least 224x224
+    if image.size[0] < 224 or image.size[1] < 224:
+        image = image.resize((224, 224), Image.LANCZOS)
+        print(f"Resized image to: {image.size}")
     
-    # Generate with the model
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=100,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-        )
+    # Define prompts for different types of descriptions
+    prompts = [
+        "Describe this image in detail.",
+        "What are the key elements in this picture?",
+        "What is happening in this image?"
+    ]
     
-    # Decode the output
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    descriptions = []
     
-    return [generated_text]  # Return as a list to maintain compatibility
+    # Process the image and generate descriptions for each prompt
+    for prompt in prompts[:num_descriptions]:
+        # Properly format the input for LLaVA
+        inputs = processor(text=prompt, images=image, return_tensors="pt").to("cuda")
+        
+        # Generate with the model
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=150,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        
+        # Decode the output
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        # Remove the prompt from the response if it's included
+        if prompt in generated_text:
+            generated_text = generated_text.replace(prompt, "").strip()
+        
+        descriptions.append(generated_text)
+    
+    return descriptions
 
 def display_image_with_descriptions(image, class_name, descriptions, save_path="output_image.png"):
     """Display the image and its descriptions, with options for headless environments."""
@@ -148,17 +171,19 @@ def main():
     # Download CIFAR-10 and get a dataloader
     trainloader, classes = download_cifar10()
     
-    # Load a single image from CIFAR-10
-    image, label = load_single_image(trainloader)
-    
-    # Get the class name
-    class_name = classes[label]
+    # Try to load an external image first
+    try:
+        image, class_name = load_external_image("sample_image.jpg")  # Update with your image path
+    except:
+        # Fall back to CIFAR-10 if external image fails
+        image, label = load_single_image(trainloader)
+        class_name = classes[label]
     
     # Load the VLM model
     model, processor = load_vlm_model()
     
     # Generate descriptions
-    descriptions = generate_image_descriptions(model, processor, image)
+    descriptions = generate_image_descriptions(model, processor, image, num_descriptions=3)
     
     # Display results
     display_image_with_descriptions(image, class_name, descriptions)
