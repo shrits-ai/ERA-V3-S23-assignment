@@ -23,7 +23,7 @@ CONFIG = {
     "BATCH_SIZE": 8,
     "LEARNING_RATE": 1e-4,
     "WEIGHT_DECAY": 0.01,
-    "EPOCHS": 10,
+    "EPOCHS": 20,
     "SAVE_EVERY": 1,
     
     # Optimizer parameters
@@ -79,8 +79,23 @@ class SigLIPProjectionModel(nn.Module):
             param.requires_grad = False
         
         # Get embedding dimensions
-        siglip_dim = self.siglip.config.hidden_size
+        # SigLIP uses 'vision_config.hidden_size' instead of 'hidden_size'
+        if hasattr(self.siglip.config, 'vision_config'):
+            siglip_dim = self.siglip.config.vision_config.hidden_size
+        elif hasattr(self.siglip.config, 'projection_dim'):
+            siglip_dim = self.siglip.config.projection_dim
+        elif hasattr(self.siglip.config, 'embed_dim'):
+            siglip_dim = self.siglip.config.embed_dim
+        else:
+            # Fallback to a common dimension for SigLIP models
+            siglip_dim = 1024
+            print(f"Warning: Could not determine SigLIP embedding dimension, using default: {siglip_dim}")
+            print(f"Available config attributes: {dir(self.siglip.config)}")
+        
         phi_dim = self.phi.config.hidden_size
+        
+        print(f"SigLIP embedding dimension: {siglip_dim}")
+        print(f"Phi-3 embedding dimension: {phi_dim}")
         
         # Create projection layer
         if projection_dim is None:
