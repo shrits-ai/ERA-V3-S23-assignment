@@ -149,8 +149,9 @@ class SigLIPProjectionModel(nn.Module):
         """
         # Get SigLIP embeddings
         with torch.no_grad():
-            siglip_outputs = self.siglip(pixel_values=images)
-            siglip_embeddings = siglip_outputs.last_hidden_state[:, 0]  # Use CLS token
+            # For SigLIP vision-only embedding, we need to use the vision_model directly
+            vision_outputs = self.siglip.vision_model(pixel_values=images)
+            siglip_embeddings = vision_outputs.pooler_output  # Use pooled output
         
         # Project to Phi-3 embedding space
         projected_embeddings = self.projection(siglip_embeddings)
