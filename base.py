@@ -85,160 +85,122 @@ def generate_conversation_data(model, processor, image, class_name):
     
     # Define conversation templates based on image type/class
     conversation_templates = {
-        # Basic identification questions
-        "identification": [
-            "What is in this image?",
-            "Can you describe what you see in this image?",
-            "What objects are present in this image?"
+        # Category A - Conversational
+        "conversational": [
+            "What's happening here?",
+            "Can you describe what's in this picture?",
+            "What do you notice first in this image?",
+            "Is this image interesting or unusual?",
+            "What catches your attention in this scene?",
+            "What stands out the most?",
+            "Can you tell me more about this scene?",
+            "Does this image look familiar to you?"
         ],
-        # Detailed description questions
-        "description": [
-            "What are the key elements in this picture?",
-            "Describe this image in detail.",
-            "What is the main subject of this image?"
+        # Category B - Detailed Description
+        "detailed_description": [
+            "What objects are present in the image?",
+            "What are the main colors and shapes in this image?",
+            "Describe the scene in as much detail as possible.",
+            "How is the object positioned in the image?",
+            "What textures or surfaces can you observe?",
+            "Describe the background and the foreground.",
+            "Are there any patterns or repeating elements?",
+            "Is the object in motion or still?"
         ],
-        # Reasoning questions
-        "reasoning": [
-            "Why might the subject of this image be in this environment?",
-            "What is unusual or interesting about this image?",
-            "What can you infer about the context of this image?"
+        # Category C - Complex Reasoning
+        "complex_reasoning": [
+            "What could be the function of the object in this image?",
+            "Why might someone be interested in this image?",
+            "What might be happening just outside the frame?",
+            "What could this image tell us about the environment it was taken in?",
+            "What might this object or scene be used for?",
+            "How could someone interact with what's shown here?",
+            "Are there any potential risks or benefits related to this scene?",
+            "What might this image make someone feel, and why?"
         ]
     }
     
     # Create a conversation structure
     conversation = []
     
-    # Add all questions from each category
+    # Select questions for this image
+    selected_questions = []
+    
+    # First, select one question from each category
     for category, questions in conversation_templates.items():
-        for question in questions:  # Use all questions in each category
-            try:
-                print(f"Processing question: {question}")  # Debug print
-                
-                # Format messages for SmolVLM 2
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": question},
-                        ]
-                    },
-                ]
-                
-                # Apply chat template
-                inputs = processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                ).to(model.device, dtype=torch.float16)
-                
-                # Generate with the model
-                with torch.no_grad():
-                    generated_ids = model.generate(
-                        **inputs, 
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                        max_new_tokens=300
-                    )
-                
-                # Decode the output
-                answer = processor.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                )[0]
-                
-                # Clean up the answer - remove any "User:" or "Assistant:" prefixes
-                if "User:" in answer:
-                    answer = answer.split("User:")[-1].strip()
-                if "Assistant:" in answer:
-                    answer = answer.split("Assistant:")[-1].strip()
-                
-                # Add to conversation
-                conversation.append({
-                    "human": question,
-                    "assistant": answer
-                })
-                
-                # For reasoning questions, add a follow-up based on the answer
-                if category == "reasoning":
-                    follow_up = "Can you elaborate more on the characteristics you've described?"
-                    
-                    # Format messages for follow-up, including previous context
-                    follow_up_messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": image},
-                                {"type": "text", "text": question},
-                            ]
-                        },
-                        {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": answer}]
-                        },
-                        {
-                            "role": "user",
-                            "content": [{"type": "text", "text": follow_up}]
-                        }
+        selected_questions.append((category, random.choice(questions)))
+    
+    # Create a pool of all remaining questions
+    all_remaining_questions = []
+    for category, questions in conversation_templates.items():
+        for question in questions:
+            if not any(q[1] == question for q in selected_questions):
+                all_remaining_questions.append((category, question))
+    
+    # Randomly select 2 more questions from the remaining pool
+    additional_questions = random.sample(all_remaining_questions, 2)
+    selected_questions.extend(additional_questions)
+    
+    # Shuffle the questions to mix up the order
+    random.shuffle(selected_questions)
+    
+    # Process each selected question
+    for category, question in selected_questions:
+        try:
+            # Format messages for SmolVLM 2
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": question},
                     ]
-                    
-                    # Apply chat template for follow-up
-                    follow_up_inputs = processor.apply_chat_template(
-                        follow_up_messages,
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt",
-                    ).to(model.device, dtype=torch.float16)
-                    
-                    # Generate follow-up response
-                    with torch.no_grad():
-                        follow_up_ids = model.generate(
-                            **follow_up_inputs, 
-                            do_sample=True,
-                            temperature=0.7,
-                            top_p=0.9,
-                            max_new_tokens=300
-                        )
-                    
-                    # Decode the follow-up output
-                    follow_up_answer = processor.batch_decode(
-                        follow_up_ids,
-                        skip_special_tokens=True,
-                    )[0]
-                    
-                    # Clean up the follow-up answer
-                    if "User:" in follow_up_answer:
-                        follow_up_answer = follow_up_answer.split("User:")[-1].strip()
-                    if "Assistant:" in follow_up_answer:
-                        follow_up_answer = follow_up_answer.split("Assistant:")[-1].strip()
-                    
-                    # Remove any duplicated content
-                    if question in follow_up_answer:
-                        parts = follow_up_answer.split(answer)
-                        if len(parts) > 1:
-                            follow_up_answer = parts[-1].strip()
-                    
-                    if follow_up in follow_up_answer:
-                        parts = follow_up_answer.split(follow_up)
-                        if len(parts) > 1:
-                            follow_up_answer = parts[-1].strip()
-                    
-                    # Add follow-up to conversation
-                    conversation.append({
-                        "human": follow_up,
-                        "assistant": follow_up_answer
-                    })
-                
-            except Exception as e:
-                print(f"Error generating conversation for question '{question}': {e}")
-                conversation.append({
-                    "human": question,
-                    "assistant": f"I apologize, but I couldn't analyze this image properly."
-                })
+                },
+            ]
+            
+            # Apply chat template
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(model.device, dtype=torch.float16)
+            
+            # Generate with the model
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs, 
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    max_new_tokens=300
+                )
+            
+            # Decode the output
+            answer = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+            )[0]
+            
+            # Clean up the answer - remove any "User:" or "Assistant:" prefixes
+            if "User:" in answer:
+                answer = answer.split("User:")[-1].strip()
+            if "Assistant:" in answer:
+                answer = answer.split("Assistant:")[-1].strip()
+            
+            # Add to conversation
+            conversation.append({
+                "human": question,
+                "assistant": answer
+            })
+            
+        except Exception as e:
+            # Silently handle errors to avoid cluttering the output
+            conversation.append({
+                "human": question,
+                "assistant": f"I apologize, but I couldn't analyze this image properly."
+            })
     
     return conversation
 
@@ -321,7 +283,7 @@ def save_dataset(output_dir, data_list, split_ratio=0.9):
     with open(os.path.join(output_dir, "metadata.json"), 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"Dataset saved to {output_dir}")
+    print(f"\nDataset saved to {output_dir}")
     print(f"Train samples: {len(train_data)}")
     print(f"Val samples: {len(val_data)}")
 
@@ -343,7 +305,7 @@ def main():
     all_data = []
     
     # Process CIFAR-10 images
-    num_images = 10000  # Aim for 1000+ images for a decent dataset
+    num_images = 11  # Aim for 1000+ images for a decent dataset
     
     # Create a tqdm progress bar
     pbar = tqdm(range(num_images), desc="Processing CIFAR-10 images", unit="image")
@@ -378,8 +340,8 @@ def main():
                 "conversations": formatted_conversation
             })
             
-            # Save progress every 10 images
-            if (i+1) % 500 == 0:
+            # Save progress every 10 images for testing, or 100 for production
+            if (i+1) % 10 == 0:
                 save_dataset(output_dir, all_data)
                 
         except Exception as e:
