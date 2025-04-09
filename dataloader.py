@@ -6,10 +6,27 @@ from PIL import Image
 import torchvision.transforms as transforms
 from transformers import AutoProcessor
 
+# Configuration
+CONFIG = {
+    # Dataset parameters
+    "IMAGE_SIZE": 384,  # SigLIP input size
+    "MAX_LENGTH": 512,  # Maximum sequence length for text
+    "NORMALIZE_MEAN": [0.4914, 0.4822, 0.4465],  # CIFAR-10 normalization mean
+    "NORMALIZE_STD": [0.2470, 0.2435, 0.2616],   # CIFAR-10 normalization std
+    
+    # Dataloader parameters
+    "BATCH_SIZE": 8,
+    "NUM_WORKERS": 4,
+    "PIN_MEMORY": True,
+    
+    # Text processing
+    "USE_FIRST_RESPONSE_ONLY": True,  # Whether to use only the first assistant response
+}
+
 class SigLIPPhi3Dataset(Dataset):
     """Dataset for training a projection layer between SigLIP and Phi-3."""
     
-    def __init__(self, data_dir, json_file, phi_processor_name, max_length=512):
+    def __init__(self, data_dir, json_file, phi_processor_name, max_length=CONFIG["MAX_LENGTH"]):
         """
         Initialize the dataset.
         
@@ -29,9 +46,9 @@ class SigLIPPhi3Dataset(Dataset):
             
         # Image transformation for SigLIP
         self.image_transform = transforms.Compose([
-            transforms.Resize((384, 384)),  # SigLIP uses 384x384 images
+            transforms.Resize((CONFIG["IMAGE_SIZE"], CONFIG["IMAGE_SIZE"])),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616])
+            transforms.Normalize(mean=CONFIG["NORMALIZE_MEAN"], std=CONFIG["NORMALIZE_STD"])
         ])
     
     def __len__(self):
@@ -51,8 +68,8 @@ class SigLIPPhi3Dataset(Dataset):
         for i, conv in enumerate(item["conversations"]):
             if conv["from"] == "assistant":
                 text += conv["value"] + " "
-                # Only use the first assistant response to keep it manageable
-                if i > 1:  # After first human-assistant pair
+                # Only use the first assistant response if configured
+                if CONFIG["USE_FIRST_RESPONSE_ONLY"] and i > 1:
                     break
         
         # Tokenize text for Phi-3
@@ -75,7 +92,7 @@ class SigLIPPhi3Dataset(Dataset):
             "text": text  # Keep original text for debugging
         }
 
-def create_dataloaders(data_dir, phi_processor_name, batch_size=8, num_workers=4):
+def create_dataloaders(data_dir, phi_processor_name, batch_size=CONFIG["BATCH_SIZE"], num_workers=CONFIG["NUM_WORKERS"]):
     """
     Create train and validation dataloaders.
     
@@ -107,7 +124,7 @@ def create_dataloaders(data_dir, phi_processor_name, batch_size=8, num_workers=4
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=CONFIG["PIN_MEMORY"]
     )
     
     val_dataloader = DataLoader(
@@ -115,7 +132,7 @@ def create_dataloaders(data_dir, phi_processor_name, batch_size=8, num_workers=4
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=CONFIG["PIN_MEMORY"]
     )
     
     return train_dataloader, val_dataloader

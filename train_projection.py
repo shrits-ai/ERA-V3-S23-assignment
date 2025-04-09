@@ -10,10 +10,46 @@ import wandb
 import numpy as np
 from dataloader import create_dataloaders
 
+# Configuration
+CONFIG = {
+    # Model parameters
+    "SIGLIP_MODEL": "google/siglip-so400m-patch14-384",
+    "PHI_MODEL": "microsoft/phi-3-mini-4k-instruct",
+    "PROJECTION_DIM": 2048,
+    "PROJECTION_LAYERS": 2,  # Number of layers in projection MLP
+    "ACTIVATION": "gelu",    # Activation function in projection MLP
+    
+    # Training parameters
+    "BATCH_SIZE": 8,
+    "LEARNING_RATE": 1e-4,
+    "WEIGHT_DECAY": 0.01,
+    "EPOCHS": 10,
+    "SAVE_EVERY": 1,
+    
+    # Optimizer parameters
+    "OPTIMIZER": "adamw",
+    "SCHEDULER": "cosine",
+    "LR_MIN_FACTOR": 0.01,   # Minimum LR will be LR * this factor
+    
+    # Loss function
+    "LOSS_FUNCTION": "mse",
+    
+    # Mixed precision
+    "USE_MIXED_PRECISION": True,
+    
+    # Data parameters
+    "DATA_DIR": "cifar10_vlm_dataset",
+    "NUM_WORKERS": 4,
+    
+    # Output parameters
+    "OUTPUT_DIR": "siglip_phi3_projection",
+    "USE_WANDB": False,
+}
+
 class SigLIPProjectionModel(nn.Module):
     """Model that projects SigLIP embeddings to Phi-3 embedding space."""
     
-    def __init__(self, siglip_model_name, phi_model_name, projection_dim=None):
+    def __init__(self, siglip_model_name, phi_model_name, projection_dim=None, num_layers=CONFIG["PROJECTION_LAYERS"]):
         """
         Initialize the projection model.
         
@@ -21,6 +57,7 @@ class SigLIPProjectionModel(nn.Module):
             siglip_model_name (str): Name of the SigLIP model
             phi_model_name (str): Name of the Phi-3 model
             projection_dim (int, optional): Dimension of the projection layer
+            num_layers (int): Number of layers in projection MLP
         """
         super().__init__()
         
@@ -49,11 +86,34 @@ class SigLIPProjectionModel(nn.Module):
         if projection_dim is None:
             projection_dim = phi_dim
         
-        self.projection = nn.Sequential(
-            nn.Linear(siglip_dim, projection_dim),
-            nn.GELU(),
-            nn.Linear(projection_dim, phi_dim)
-        )
+        # Choose activation function
+        if CONFIG["ACTIVATION"].lower() == "gelu":
+            activation = nn.GELU()
+        elif CONFIG["ACTIVATION"].lower() == "relu":
+            activation = nn.ReLU()
+        elif CONFIG["ACTIVATION"].lower() == "silu":
+            activation = nn.SiLU()
+        else:
+            activation = nn.GELU()  # Default to GELU
+        
+        # Build projection MLP
+        if num_layers == 1:
+            self.projection = nn.Linear(siglip_dim, phi_dim)
+        else:
+            layers = []
+            # First layer
+            layers.append(nn.Linear(siglip_dim, projection_dim))
+            layers.append(activation)
+            
+            # Middle layers (if any)
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(projection_dim, projection_dim))
+                layers.append(activation)
+            
+            # Last layer
+            layers.append(nn.Linear(projection_dim, phi_dim))
+            
+            self.projection = nn.Sequential(*layers)
         
         # Initialize weights
         for module in self.projection.modules():
@@ -134,7 +194,7 @@ def train_epoch(model, train_loader, optimizer, scaler, loss_fn, device):
         optimizer.zero_grad()
         
         # Forward pass with mixed precision
-        with autocast():
+        with autocast(enabled=CONFIG["USE_MIXED_PRECISION"]):
             # Get projected embeddings
             projected_embeddings = model(images)
             
@@ -188,8 +248,14 @@ def validate(model, val_loader, loss_fn, device):
     return total_loss / len(val_loader)
 
 def main(args):
+    # Print configuration
+    print("Running with configuration:")
+    for key, value in vars(args).items():
+        print(f"  {key}: {value}")
+    
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
     # Initialize wandb if enabled
     if args.use_wandb:
@@ -206,38 +272,81 @@ def main(args):
         num_workers=args.num_workers
     )
     
+    print(f"Created dataloaders: {len(train_loader)} training batches, {len(val_loader)} validation batches")
+    
     # Create model
     model = SigLIPProjectionModel(
         siglip_model_name=args.siglip_model_name,
         phi_model_name=args.phi_model_name,
-        projection_dim=args.projection_dim
+        projection_dim=args.projection_dim,
+        num_layers=args.projection_layers
     ).to(device)
     
+    print(f"Created model with projection dimension: {args.projection_dim}, layers: {args.projection_layers}")
+    
     # Set up optimizer
-    optimizer = optim.AdamW(
-        model.projection.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
+    if args.optimizer.lower() == "adamw":
+        optimizer = optim.AdamW(
+            model.projection.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay
+        )
+    elif args.optimizer.lower() == "adam":
+        optimizer = optim.Adam(
+            model.projection.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.projection.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay
+        )
     
     # Set up learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=args.learning_rate / 100
-    )
+    if args.scheduler.lower() == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.learning_rate * args.lr_min_factor
+        )
+    elif args.scheduler.lower() == "linear":
+        scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=args.lr_min_factor,
+            total_iters=args.epochs
+        )
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.learning_rate * args.lr_min_factor
+        )
     
     # Set up loss function
-    loss_fn = nn.MSELoss()
+    if args.loss_function.lower() == "mse":
+        loss_fn = nn.MSELoss()
+    elif args.loss_function.lower() == "l1":
+        loss_fn = nn.L1Loss()
+    elif args.loss_function.lower() == "smoothl1":
+        loss_fn = nn.SmoothL1Loss()
+    else:
+        loss_fn = nn.MSELoss()
+    
+    print(f"Using {args.loss_function} loss function")
     
     # Set up gradient scaler for mixed precision
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=args.use_mixed_precision)
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Training loop
     best_val_loss = float('inf')
+    
+    print(f"Starting training for {args.epochs} epochs")
     
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1}/{args.epochs}")
@@ -250,14 +359,15 @@ def main(args):
         
         # Update learning rate
         scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
         
         # Log metrics
-        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
         if args.use_wandb:
             wandb.log({
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "learning_rate": scheduler.get_last_lr()[0]
+                "learning_rate": current_lr
             })
         
         # Save best model
@@ -289,38 +399,53 @@ def main(args):
     }, os.path.join(args.output_dir, "final_model.pt"))
     
     print("Training complete!")
+    print(f"Best validation loss: {best_val_loss:.4f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SigLIP to Phi-3 projection layer")
     
     # Model arguments
-    parser.add_argument("--siglip_model_name", type=str, default="google/siglip-so400m-patch14-384",
+    parser.add_argument("--siglip_model_name", type=str, default=CONFIG["SIGLIP_MODEL"],
                         help="Name of the SigLIP model")
-    parser.add_argument("--phi_model_name", type=str, default="microsoft/phi-3-mini-4k-instruct",
+    parser.add_argument("--phi_model_name", type=str, default=CONFIG["PHI_MODEL"],
                         help="Name of the Phi-3 model")
-    parser.add_argument("--projection_dim", type=int, default=2048,
+    parser.add_argument("--projection_dim", type=int, default=CONFIG["PROJECTION_DIM"],
                         help="Dimension of the projection layer")
+    parser.add_argument("--projection_layers", type=int, default=CONFIG["PROJECTION_LAYERS"],
+                        help="Number of layers in projection MLP")
     
     # Data arguments
-    parser.add_argument("--data_dir", type=str, default="cifar10_vlm_dataset",
+    parser.add_argument("--data_dir", type=str, default=CONFIG["DATA_DIR"],
                         help="Directory containing the dataset")
-    parser.add_argument("--batch_size", type=int, default=8,
+    parser.add_argument("--batch_size", type=int, default=CONFIG["BATCH_SIZE"],
                         help="Batch size for training")
-    parser.add_argument("--num_workers", type=int, default=4,
+    parser.add_argument("--num_workers", type=int, default=CONFIG["NUM_WORKERS"],
                         help="Number of workers for data loading")
     
     # Training arguments
-    parser.add_argument("--epochs", type=int, default=10,
+    parser.add_argument("--epochs", type=int, default=CONFIG["EPOCHS"],
                         help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=1e-4,
+    parser.add_argument("--learning_rate", type=float, default=CONFIG["LEARNING_RATE"],
                         help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.01,
+    parser.add_argument("--weight_decay", type=float, default=CONFIG["WEIGHT_DECAY"],
                         help="Weight decay")
-    parser.add_argument("--save_every", type=int, default=1,
+    parser.add_argument("--save_every", type=int, default=CONFIG["SAVE_EVERY"],
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--output_dir", type=str, default="siglip_phi3_projection",
+    parser.add_argument("--optimizer", type=str, default=CONFIG["OPTIMIZER"],
+                        help="Optimizer to use (adamw, adam)")
+    parser.add_argument("--scheduler", type=str, default=CONFIG["SCHEDULER"],
+                        help="Learning rate scheduler (cosine, linear)")
+    parser.add_argument("--lr_min_factor", type=float, default=CONFIG["LR_MIN_FACTOR"],
+                        help="Minimum learning rate factor")
+    parser.add_argument("--loss_function", type=str, default=CONFIG["LOSS_FUNCTION"],
+                        help="Loss function (mse, l1, smoothl1)")
+    parser.add_argument("--use_mixed_precision", action="store_true", default=CONFIG["USE_MIXED_PRECISION"],
+                        help="Whether to use mixed precision training")
+    
+    # Output arguments
+    parser.add_argument("--output_dir", type=str, default=CONFIG["OUTPUT_DIR"],
                         help="Directory to save models")
-    parser.add_argument("--use_wandb", action="store_true",
+    parser.add_argument("--use_wandb", action="store_true", default=CONFIG["USE_WANDB"],
                         help="Whether to use Weights & Biases for logging")
     
     args = parser.parse_args()
