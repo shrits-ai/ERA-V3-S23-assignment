@@ -10,7 +10,9 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import wandb
 import numpy as np
 from dataloader import create_dataloaders
-from train_projection import SigLIPProjectionModel
+
+# Import both the model class and CONFIG from train_projection
+from train_projection import SigLIPProjectionModel, CONFIG as PROJECTION_CONFIG
 
 # Configuration
 CONFIG = {
@@ -18,6 +20,10 @@ CONFIG = {
     "SIGLIP_MODEL": "google/siglip-so400m-patch14-384",
     "PHI_MODEL": "microsoft/phi-3-mini-4k-instruct",
     "PROJECTION_MODEL_PATH": "siglip_phi3_projection/best_model.pt",
+    
+    # Use the same projection parameters from train_projection.py
+    "PROJECTION_DIM": PROJECTION_CONFIG["PROJECTION_DIM"],
+    "PROJECTION_LAYERS": PROJECTION_CONFIG["PROJECTION_LAYERS"],
     
     # QLoRA parameters
     "LORA_R": 16,
@@ -58,7 +64,8 @@ CONFIG = {
 class MultimodalPhiModel(nn.Module):
     """Model that combines SigLIP projection with Phi-3 for multimodal capabilities."""
     
-    def __init__(self, siglip_model_name, phi_model_name, projection_model_path, quantization_config=None):
+    def __init__(self, siglip_model_name, phi_model_name, projection_model_path, 
+                 quantization_config=None, projection_dim=None, projection_layers=None):
         """
         Initialize the multimodal model.
         
@@ -67,13 +74,17 @@ class MultimodalPhiModel(nn.Module):
             phi_model_name (str): Name of the Phi-3 model
             projection_model_path (str): Path to the trained projection model
             quantization_config: Configuration for quantization
+            projection_dim: Dimension of the projection layer
+            projection_layers: Number of layers in projection MLP
         """
         super().__init__()
         
         # Load SigLIP projection model
         self.projection_model = SigLIPProjectionModel(
             siglip_model_name=siglip_model_name,
-            phi_model_name=phi_model_name
+            phi_model_name=phi_model_name,
+            projection_dim=projection_dim,
+            num_layers=projection_layers
         )
         
         # Load trained projection weights
@@ -259,7 +270,9 @@ def main(args):
         siglip_model_name=args.siglip_model_name,
         phi_model_name=args.phi_model_name,
         projection_model_path=args.projection_model_path,
-        quantization_config=quantization_config
+        quantization_config=quantization_config,
+        projection_dim=args.projection_dim,
+        projection_layers=args.projection_layers
     )
     
     # Apply LoRA to the model
@@ -413,6 +426,12 @@ if __name__ == "__main__":
                         help="Directory to save models")
     parser.add_argument("--use_wandb", action="store_true", default=CONFIG["USE_WANDB"],
                         help="Whether to use Weights & Biases for logging")
+    
+    # Projection arguments
+    parser.add_argument("--projection_dim", type=int, default=CONFIG["PROJECTION_DIM"],
+                        help="Dimension of the projection layer")
+    parser.add_argument("--projection_layers", type=int, default=CONFIG["PROJECTION_LAYERS"],
+                        help="Number of layers in projection MLP")
     
     args = parser.parse_args()
     main(args) 
