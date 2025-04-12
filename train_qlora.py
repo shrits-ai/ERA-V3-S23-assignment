@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import argparse
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
@@ -36,10 +36,10 @@ CONFIG = {
     "QUANT_TYPE": "nf4",     # NF4 data type
     
     # Training parameters
-    "BATCH_SIZE": 4,
+    "BATCH_SIZE": 8,
     "LEARNING_RATE": 2e-4,
     "WEIGHT_DECAY": 0.01,
-    "EPOCHS": 3,
+    "EPOCHS": 1,
     "SAVE_EVERY": 1,
     "GRADIENT_ACCUMULATION_STEPS": 4,
     
@@ -51,6 +51,7 @@ CONFIG = {
     
     # Mixed precision
     "USE_MIXED_PRECISION": True,
+    "COMPUTE_DTYPE": torch.bfloat16, # Define compute dtype centrally (bfloat16 recommended for Ampere+)
     
     # Data parameters
     "DATA_DIR": "cifar10_vlm_dataset",
@@ -63,9 +64,10 @@ CONFIG = {
 
 class MultimodalPhiModel(nn.Module):
     """Model that combines SigLIP projection with Phi-3 for multimodal capabilities."""
-    
-    def __init__(self, siglip_model_name, phi_model_name, projection_model_path, 
-                 quantization_config=None, projection_dim=None, projection_layers=None):
+
+    def __init__(self, siglip_model_name, phi_model_name, projection_model_path,
+                 quantization_config=None, projection_dim=None, projection_layers=None,
+                 compute_dtype=torch.bfloat16): # Added compute_dtype argument
         """
         Initialize the multimodal model.
         
@@ -76,9 +78,35 @@ class MultimodalPhiModel(nn.Module):
             quantization_config: Configuration for quantization
             projection_dim: Dimension of the projection layer
             projection_layers: Number of layers in projection MLP
+            compute_dtype: Data type for computation (e.g., torch.bfloat16)
         """
         super().__init__()
-        
+
+        self.compute_dtype = compute_dtype
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Load processor first to check dimensions if needed
+        print(f"Loading processor for {phi_model_name}...")
+        # Use trust_remote_code=True if required by the model, common for newer models like Phi-3
+        self.processor = AutoProcessor.from_pretrained(phi_model_name, trust_remote_code=True)
+
+        # --- Start Fix for Pad Token ---
+        # Access pad_token directly on the processor object
+        if not hasattr(self.processor, 'pad_token') or self.processor.pad_token is None:
+             print("Processor does not have pad_token set.")
+             # Check if eos_token exists and is suitable
+             if hasattr(self.processor, 'eos_token') and self.processor.eos_token:
+                 print(f"Setting pad_token to eos_token: '{self.processor.eos_token}'")
+                 self.processor.pad_token = self.processor.eos_token
+             else:
+                 # Fallback: Add a generic pad token if EOS is also missing (unlikely but safe)
+                 print("Warning: EOS token also missing. Adding a default <|pad|> token.")
+                 self.processor.add_special_tokens({'pad_token': '<|pad|>'})
+        else:
+            print(f"Processor pad_token already set: '{self.processor.pad_token}'")
+        # --- End Fix for Pad Token ---
+
+
         # Load SigLIP projection model
         self.projection_model = SigLIPProjectionModel(
             siglip_model_name=siglip_model_name,
@@ -94,18 +122,39 @@ class MultimodalPhiModel(nn.Module):
             self.projection_model.projection.load_state_dict(checkpoint["model_state_dict"])
         else:
             print(f"Warning: Projection model path {projection_model_path} not found. Using untrained projection.")
+        # Move the projection model to the correct device and data type
+        print(f"Casting projection model to {self.compute_dtype} on device {self.device}")
+        self.projection_model.to(self.device, dtype=self.compute_dtype)
         
         # Freeze the projection model
         for param in self.projection_model.parameters():
             param.requires_grad = False
         
         # Load Phi-3 model with quantization for QLoRA
+        # Use trust_remote_code=True here as well
+        model_load_kwargs = {
+            "torch_dtype": self.compute_dtype,
+            "device_map": "auto", # Handles device placement for large models
+            "trust_remote_code": True
+        }
         if quantization_config:
+            print("Loading Phi-3 model with quantization...")
+            model_load_kwargs["quantization_config"] = quantization_config
             self.phi = AutoModelForCausalLM.from_pretrained(
                 phi_model_name,
                 quantization_config=quantization_config,
                 device_map="auto"
             )
+            # --- Set Model's Pad Token ID ---
+            # Ensure the model's config uses the same pad token ID as the processor
+            # Access pad_token_id directly on the processor
+            if hasattr(self.processor, 'pad_token_id') and self.processor.pad_token_id is not None:
+                print(f"Setting model's pad_token_id to: {self.processor.pad_token_id}")
+                self.phi.config.pad_token_id = self.processor.pad_token_id
+            else:
+                print("Warning: Could not determine processor's pad_token_id. Model config might be inconsistent.")
+            # ---
+
             # Prepare model for k-bit training
             self.phi = prepare_model_for_kbit_training(self.phi)
         else:
@@ -131,40 +180,71 @@ class MultimodalPhiModel(nn.Module):
         Returns:
             torch.Tensor: Loss or logits
         """
-        # Get projected image embeddings
-        with torch.no_grad():
-            image_embeddings = self.projection_model(images)
-        
-        # Get the embedding layer from Phi model
-        input_embeddings = self.phi.get_input_embeddings()(input_ids)
-        
-        # Replace the first token embedding with the image embedding
-        # We'll use the first token position to inject the image information
-        batch_size = input_embeddings.shape[0]
-        for i in range(batch_size):
-            input_embeddings[i, 0, :] = image_embeddings[i]
-        
-        # Forward pass through Phi model
+        # Ensure images are on the same device and dtype as the projection model expects
+        images = images.to(self.projection_model.siglip.device, dtype=self.compute_dtype)
+
+        # Get projected image embeddings from the frozen projection model
+        # No need for torch.no_grad() as the model is frozen and in eval mode
+        image_embeddings = self.projection_model(images) # Shape: [batch_size, proj_dim]
+
+        # Ensure projected embeddings match Phi's expected embedding dimension
+        phi_embedding_dim = self.phi.get_input_embeddings().weight.shape[-1]
+        if image_embeddings.shape[-1] != phi_embedding_dim:
+             raise ValueError(f"Projected image embedding dimension ({image_embeddings.shape[-1]}) "
+                              f"does not match Phi-3 embedding dimension ({phi_embedding_dim}). "
+                              "Check your SigLIPProjectionModel's output dimension (projection_dim).")
+
+        # Get the token embeddings from Phi model
+        # Ensure input_ids are on the correct device (handled by device_map="auto" usually)
+        # input_ids = input_ids.to(self.phi.device) # Usually not needed with device_map
+        input_embeddings = self.phi.get_input_embeddings()(input_ids) # Shape: [batch_size, seq_len, phi_emb_dim]
+
+        # Prepare image embeddings for concatenation: ensure same device and dtype as input_embeddings
+        image_embeddings = image_embeddings.to(input_embeddings.device, dtype=input_embeddings.dtype)
+
+        # Add the sequence length dimension: [batch_size, 1, phi_emb_dim]
+        image_embeddings_unsqueezed = image_embeddings.unsqueeze(1)
+
+        # Concatenate image embedding at the beginning
+        # Input Embeddings: [ImageEmb, TokenEmb_1, TokenEmb_2, ...]
+        final_embeddings = torch.cat(
+            [image_embeddings_unsqueezed, input_embeddings[:, 1:, :]], # Exclude the original first token embedding
+            dim=1
+        )
+
+        # Adjust attention mask: The image embedding corresponds to the first position.
+        # The original attention mask should be kept as is if it correctly masks padding.
+        # The image token should be attended to (mask=1).
+        # Make sure attention mask is on the correct device
+        # attention_mask = attention_mask.to(self.phi.device) # Usually not needed with device_map
+
+        # Ensure labels are also on the correct device if provided
+        if labels is not None:
+            # labels = labels.to(self.phi.device) # Usually not needed with device_map
+            pass # device_map should handle label device placement relative to logits
+
+        # Forward pass through Phi model using the combined embeddings
         outputs = self.phi(
-            inputs_embeds=input_embeddings,
-            attention_mask=attention_mask,
+            inputs_embeds=final_embeddings,
+            attention_mask=attention_mask, # Use original mask, assuming image replaces a non-padded token
             labels=labels,
             return_dict=True
         )
         
         return outputs
 
-def train_epoch(model, train_loader, optimizer, scaler, device, gradient_accumulation_steps=1):
+def train_epoch(model, train_loader, optimizer, scaler, device, gradient_accumulation_steps=1, compute_dtype=torch.bfloat16): # Added compute_dtype
     """Train for one epoch."""
     model.train()
     total_loss = 0
+    num_samples = 0
     
     progress_bar = tqdm(train_loader, desc="Training")
     optimizer.zero_grad()
     
     for step, batch in enumerate(progress_bar):
         # Move data to device
-        images = batch["image"].to(device)
+        images = batch["image"]
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         
@@ -172,17 +252,17 @@ def train_epoch(model, train_loader, optimizer, scaler, device, gradient_accumul
         labels = input_ids.clone()
         # Shift right to create targets and mask the image token position (first token)
         labels[:, 0] = -100  # Don't compute loss for the image token position
-        
+        labels = labels.to(device) 
         # Forward pass with mixed precision
-        with autocast(enabled=CONFIG["USE_MIXED_PRECISION"]):
-            outputs = model(
-                images=images,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            loss = outputs.loss / gradient_accumulation_steps
+        with autocast(device_type=device.type, dtype=compute_dtype, enabled=scaler.is_enabled()):
+             outputs = model(
+                 images=images, # Will be moved to projection_model.device inside forward
+                 input_ids=input_ids,
+                 attention_mask=attention_mask,
+                 labels=labels # Will be moved to phi.device inside forward if needed
+             )
+             # Loss is computed based on logits and labels on potentially different devices (due to device_map)
+             loss = outputs.loss / gradient_accumulation_steps
         
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
@@ -190,7 +270,7 @@ def train_epoch(model, train_loader, optimizer, scaler, device, gradient_accumul
         # Update weights if we've accumulated enough gradients
         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.phi.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.phi.parameters()), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -199,36 +279,43 @@ def train_epoch(model, train_loader, optimizer, scaler, device, gradient_accumul
         total_loss += loss.item() * gradient_accumulation_steps
         progress_bar.set_postfix({"loss": loss.item() * gradient_accumulation_steps})
     
-    return total_loss / len(train_loader)
+    # Return average loss per sample for the epoch
+    avg_epoch_loss = total_loss / num_samples if num_samples > 0 else 0.0
+    return avg_epoch_loss
 
-def validate(model, val_loader, device):
+def validate(model, val_loader, device, compute_dtype=torch.bfloat16):
     """Validate the model."""
     model.eval()
     total_loss = 0
+    num_samples = 0
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validation"):
             # Move data to device
-            images = batch["image"].to(device)
+            images = batch["image"]
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             
             # Create labels for causal language modeling
             labels = input_ids.clone()
             labels[:, 0] = -100  # Don't compute loss for the image token position
+            labels = labels.to(device) # Move labels initially
             
             # Forward pass
-            outputs = model(
-                images=images,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            with autocast(device_type=device.type, dtype=compute_dtype, enabled=CONFIG["USE_MIXED_PRECISION"]): # Use config flag directly
+                outputs = model(
+                    images=images,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
             
-            loss = outputs.loss
-            total_loss += loss.item()
+            total_loss += outputs.loss.item() * images.size(0) # Accumulate loss weighted by batch size
+            num_samples += images.size(0)
     
-    return total_loss / len(val_loader)
+    # Return average loss per sample for the validation set
+    avg_val_loss = total_loss / num_samples if num_samples > 0 else 0.0
+    return avg_val_loss
 
 def main(args):
     # Print configuration
@@ -239,6 +326,9 @@ def main(args):
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    # Determine compute dtype from config
+    compute_dtype = CONFIG["COMPUTE_DTYPE"]
+    print(f"Using compute dtype: {compute_dtype}")
     
     # Initialize wandb if enabled
     if args.use_wandb:
@@ -260,7 +350,7 @@ def main(args):
     # Set up quantization config for QLoRA
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=compute_dtype, # Use defined compute_dtype
         bnb_4bit_quant_type=args.quant_type,
         bnb_4bit_use_double_quant=True
     )
@@ -272,7 +362,8 @@ def main(args):
         projection_model_path=args.projection_model_path,
         quantization_config=quantization_config,
         projection_dim=args.projection_dim,
-        projection_layers=args.projection_layers
+        projection_layers=args.projection_layers,
+        compute_dtype=compute_dtype # Pass compute_dtype
     )
     
     # Apply LoRA to the model
@@ -289,8 +380,11 @@ def main(args):
     model.phi.print_trainable_parameters()
     
     # Set up optimizer
+    # Set up optimizer - only optimize trainable LoRA parameters
+    # Filter parameters that require gradients
+    trainable_params = filter(lambda p: p.requires_grad, model.phi.parameters())
     optimizer = optim.AdamW(
-        model.phi.parameters(),
+        trainable_params,
         lr=args.learning_rate,
         weight_decay=args.weight_decay
     )
@@ -302,13 +396,13 @@ def main(args):
     if args.scheduler.lower() == "cosine":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=total_steps - warmup_steps,
+            T_max=max(1, total_steps - warmup_steps), # Ensure T_max is at least 1
             eta_min=args.learning_rate * args.lr_min_factor
         )
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=total_steps - warmup_steps,
+            T_max=max(1, total_update_steps - warmup_steps),
             eta_min=args.learning_rate * args.lr_min_factor
         )
     
@@ -333,15 +427,16 @@ def main(args):
             optimizer, 
             scaler, 
             device, 
-            gradient_accumulation_steps=args.gradient_accumulation_steps
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            compute_dtype=compute_dtype
         )
         
         # Validate
-        val_loss = validate(model, val_loader, device)
+        val_loss = validate(model, val_loader, device, compute_dtype=compute_dtype)
         
         # Update learning rate
         scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        current_lr = optimizer.param_groups[0]['lr'] # Get current LR after scheduler step
         
         # Log metrics
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
@@ -370,7 +465,9 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="QLoRA fine-tuning for Phi-3 with SigLIP projection")
-    
+
+    # Get CONFIG from CONFIG dict
+    compute_dtype = CONFIG["COMPUTE_DTYPE"]
     # Model arguments
     parser.add_argument("--siglip_model_name", type=str, default=CONFIG["SIGLIP_MODEL"],
                         help="Name of the SigLIP model")
