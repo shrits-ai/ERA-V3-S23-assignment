@@ -20,7 +20,7 @@ CONFIG = {
     "ACTIVATION": "gelu",    # Activation function in projection MLP
     
     # Training parameters
-    "BATCH_SIZE": 8,
+    "BATCH_SIZE": 16,
     "LEARNING_RATE": 1e-4,
     "WEIGHT_DECAY": 0.01,
     "EPOCHS": 20,
