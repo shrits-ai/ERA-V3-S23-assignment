@@ -39,7 +39,7 @@ CONFIG = {
     "BATCH_SIZE": 8,
     "LEARNING_RATE": 2e-4,
     "WEIGHT_DECAY": 0.01,
-    "EPOCHS": 1,
+    "EPOCHS": 5,
     "SAVE_EVERY": 1,
     "GRADIENT_ACCUMULATION_STEPS": 4,
     
@@ -233,55 +233,80 @@ class MultimodalPhiModel(nn.Module):
         
         return outputs
 
-def train_epoch(model, train_loader, optimizer, scaler, device, gradient_accumulation_steps=1, compute_dtype=torch.bfloat16): # Added compute_dtype
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0
-    num_samples = 0
-    
+# --- *** MODIFIED train_epoch *** ---
+def train_epoch(model, train_loader, optimizer, lr_scheduler, scaler, device, gradient_accumulation_steps=1, grad_clip_norm=1.0, compute_dtype=torch.bfloat16):
+    """Train for one epoch with corrected loss accumulation and scheduler stepping."""
+    model.train() # Ensure model is in training mode (for dropout, etc.)
+    total_loss = 0.0
+    num_samples = 0 # Initialize num_samples
+
     progress_bar = tqdm(train_loader, desc="Training")
-    optimizer.zero_grad()
-    
+    optimizer.zero_grad() # Clear gradients at the start of the epoch
+
     for step, batch in enumerate(progress_bar):
         # Move data to device
-        images = batch["image"]
+        images = batch["image"] # Keep images on CPU initially, move inside forward
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        
-        # Create labels for causal language modeling (shift input_ids right)
+
+        # Create labels for causal language modeling
         labels = input_ids.clone()
-        # Shift right to create targets and mask the image token position (first token)
         labels[:, 0] = -100  # Don't compute loss for the image token position
-        labels = labels.to(device) 
+        # Ensure labels are on the same device as the final logits will be (handled by device_map)
+        # labels = labels.to(device) # Can move here or rely on device_map
+
+        batch_size = images.size(0) # Get batch size for averaging
+
         # Forward pass with mixed precision
+        # Use device.type for autocast device
         with autocast(device_type=device.type, dtype=compute_dtype, enabled=scaler.is_enabled()):
              outputs = model(
-                 images=images, # Will be moved to projection_model.device inside forward
+                 images=images,
                  input_ids=input_ids,
                  attention_mask=attention_mask,
-                 labels=labels # Will be moved to phi.device inside forward if needed
+                 labels=labels
              )
-             # Loss is computed based on logits and labels on potentially different devices (due to device_map)
-             loss = outputs.loss / gradient_accumulation_steps
-        
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
-        
-        # Update weights if we've accumulated enough gradients
+             loss = outputs.loss # Loss is computed internally by the model
+
+        # Check if loss is valid before accumulation and backward pass
+        if loss is not None and not torch.isnan(loss):
+            loss = loss / gradient_accumulation_steps # Normalize loss for accumulation
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+
+            # Accumulate total loss correctly weighted by batch size
+            # Use loss.item() for accumulation to free graph memory
+            total_loss += loss.item() * gradient_accumulation_steps * batch_size
+            num_samples += batch_size # Increment sample count
+
+            progress_bar.set_postfix({"loss": loss.item() * gradient_accumulation_steps}) # Show effective loss for this step batch
+        else:
+             print(f"Warning: Step {step}: Received None or NaN loss. Skipping gradient update for this batch.")
+             # If loss is invalid, we might need to skip the optimizer step for this accumulation cycle
+             # Easiest is to just not call backward and proceed. Optimizer step check will handle it.
+
+
+        # --- Optimizer Step Block ---
+        # Check if it's time to update weights
         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_loader) - 1:
+            # Unscale gradients before clipping
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.phi.parameters()), 1.0)
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.phi.parameters()), grad_clip_norm)
+            # Optimizer step (will check for inf/NaNs)
             scaler.step(optimizer)
+            # Update the scaler for next iteration
             scaler.update()
+            # Step the learning rate scheduler
+            lr_scheduler.step() # <<<--- SCHEDULER STEP MOVED HERE
+            # Zero gradients for the next accumulation cycle
             optimizer.zero_grad()
-        
-        # Update progress
-        total_loss += loss.item() * gradient_accumulation_steps
-        progress_bar.set_postfix({"loss": loss.item() * gradient_accumulation_steps})
-    
-    # Return average loss per sample for the epoch
+
+    # Calculate average loss per sample for the epoch
     avg_epoch_loss = total_loss / num_samples if num_samples > 0 else 0.0
+    print(f"\nEpoch Train Summary: total_loss={total_loss:.4f}, num_samples={num_samples}")
     return avg_epoch_loss
+# --- *** END MODIFIED train_epoch *** ---
 
 def validate(model, val_loader, device, compute_dtype=torch.bfloat16):
     """Validate the model."""

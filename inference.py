@@ -88,7 +88,7 @@ def process_image(image_path, transform=None):
         transform = transforms.Compose([
             transforms.Resize((384, 384)),  # SigLIP default input size
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) # Common normalization
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]) # Common normalization
         ])
 
     # Transform image
@@ -97,7 +97,7 @@ def process_image(image_path, transform=None):
     return image_tensor
 # --- End of process_image function definition ---
 
-def generate_text_from_image(phi_model_with_adapter, projection_model, image_tensor, phi_tokenizer, device="cuda", max_length=100):
+def generate_text_from_image(phi_model_with_adapter, projection_model, image_tensor, phi_tokenizer, device="cuda", max_length=100, prompt="Describe what you see in this image."):
     """
     Generate text from an image using the PEFT adapter model and projection model.
     (Modified function signature and internal logic)
@@ -133,40 +133,38 @@ def generate_text_from_image(phi_model_with_adapter, projection_model, image_ten
         image_embeddings_unsqueezed = image_embeddings.unsqueeze(1) # [batch_size, 1, phi_emb_dim]
 
 
-        # 3. Prepare BOS token embedding
-        bos_token_id = phi_tokenizer.bos_token_id
-        dummy_bos_input_ids = torch.tensor([[bos_token_id]], device=embedding_layer.weight.device)
-        bos_embedding = embedding_layer(dummy_bos_input_ids) # Shape: [batch_size, 1, phi_emb_dim]
+        # 3. Tokenize the prompt and get its embeddings
+        prompt_tokens = phi_tokenizer(prompt, return_tensors="pt").to(embedding_layer.weight.device)
+        prompt_embeddings = embedding_layer(prompt_tokens.input_ids) # [batch_size, prompt_len, phi_emb_dim]
 
 
-        # 4. Combine embeddings: [ImageEmb, BOSEmb] -> Phi starts generation from here
-        combined_embeddings = torch.cat([image_embeddings_unsqueezed, bos_embedding], dim=1)
-        # Shape: [batch_size, 2, phi_emb_dim]
+        # 4. Combine embeddings: [ImageEmb, PromptEmb] -> Phi starts generation from here
+        combined_embeddings = torch.cat([image_embeddings_unsqueezed, prompt_embeddings], dim=1)
+        # Shape: [batch_size, 1+prompt_len, phi_emb_dim]
         batch_size = combined_embeddings.shape[0]
-        sequence_length = combined_embeddings.shape[1] # Should be 2
+        sequence_length = combined_embeddings.shape[1]
 
 
         # 5. Create Attention Mask
         attention_mask = torch.ones(batch_size, sequence_length, dtype=torch.long, device=combined_embeddings.device)
-        # attention_mask shape: [batch_size, 2]
 
 
-        # 6. *** ADD DUMMY INPUT IDS ***
-        # Create dummy input IDs corresponding to the embeddings.
-        # Use UNK token ID for the image part, BOS for the text start.
-        unk_token_id = phi_tokenizer.unk_token_id if phi_tokenizer.unk_token_id is not None else bos_token_id # Fallback if no UNK
-        input_ids = torch.tensor([[unk_token_id, bos_token_id]], dtype=torch.long, device=combined_embeddings.device).repeat(batch_size, 1)
-        # input_ids shape: [batch_size, 2]
+        # 6. Create dummy input IDs corresponding to the embeddings
+        # Use UNK token ID for the image part, then the actual prompt token IDs
+        unk_token_id = phi_tokenizer.unk_token_id if phi_tokenizer.unk_token_id is not None else phi_tokenizer.bos_token_id
+        
+        # Create input_ids with UNK for image and actual tokens for prompt
+        input_ids = torch.cat([
+            torch.tensor([[unk_token_id]], device=prompt_tokens.input_ids.device),
+            prompt_tokens.input_ids
+        ], dim=1)
 
 
         # 7. Generate text passing BOTH input_ids and inputs_embeds
-        # The generate function should prioritize inputs_embeds if provided,
-        # but input_ids might help initialize internal states correctly.
         outputs = phi_model_with_adapter.generate(
-            input_ids=input_ids,             # Pass dummy input_ids
-            inputs_embeds=combined_embeddings, # Pass actual embeddings
-            attention_mask=attention_mask,     # Pass attention mask
-            # position_ids=position_ids,     # Let's remove explicit position_ids for now with this approach
+            input_ids=input_ids,
+            inputs_embeds=combined_embeddings,
+            attention_mask=attention_mask,
             max_length=max_length,
             do_sample=True,
             temperature=0.7,
@@ -218,7 +216,8 @@ def main(args):
         image_tensor=image_tensor,
         phi_tokenizer=phi_tokenizer,
         device=device,
-        max_length=args.max_length
+        max_length=args.max_length,
+        prompt=args.prompt
     )
 
     # Print results
@@ -252,6 +251,8 @@ if __name__ == "__main__":
                         help="Path to the input image")
     parser.add_argument("--max_length", type=int, default=100,
                         help="Maximum length of generated text")
+    parser.add_argument("--prompt", type=str, default="What object is shown in this image? Describe it in detail.",
+                        help="Prompt to guide the image description generation")
 
     args = parser.parse_args()
 
