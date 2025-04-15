@@ -78,87 +78,130 @@ def load_vlm_model():
     
     return model, processor
 
+import random
+import torch
+
 def generate_conversation_data(model, processor, image, class_name):
-    """Generate conversational data similar to LLaVA-Instruct-150k for the given image."""
-    # Save the image being passed to the model for debugging
+    """
+    Generate conversational data with a robust fallback for the first question only.
+    
+    The conversation includes:
+      1) A default anchor question that enforces the CIFAR‑10 label with fallback if uncertain.
+      2) 5 additional questions (3, one from each category; and 2 extra chosen overall)
+         without any fallback mechanism.
+    """
     image.save("model_input_image.png")
     
-    # Define conversation templates based on image type/class
+    # Known CIFAR-10 classes for reference.
+    cifar10_classes = [
+        "airplane", "automobile", "bird", "cat", "deer",
+        "dog", "frog", "horse", "ship", "truck"
+    ]
+    
+    # Prompt pools: each category has prompts with and without label.
     conversation_templates = {
-        # Category A - Conversational
-        "conversational": [
-            "What's happening here?",
-            "Can you describe what's in this picture?",
-            "What do you notice first in this image?",
-            "Is this image interesting or unusual?",
-            "What catches your attention in this scene?",
-            "What stands out the most?",
-            "Can you tell me more about this scene?",
-            "Does this image look familiar to you?"
-        ],
-        # Category B - Detailed Description
-        "detailed_description": [
-            "What objects are present in the image?",
-            "What are the main colors and shapes in this image?",
-            "Describe the scene in as much detail as possible.",
-            "How is the object positioned in the image?",
-            "What textures or surfaces can you observe?",
-            "Describe the background and the foreground.",
-            "Are there any patterns or repeating elements?",
-            "Is the object in motion or still?"
-        ],
-        # Category C - Complex Reasoning
-        "complex_reasoning": [
-            "What could be the function of the object in this image?",
-            "Why might someone be interested in this image?",
-            "What might be happening just outside the frame?",
-            "What could this image tell us about the environment it was taken in?",
-            "What might this object or scene be used for?",
-            "How could someone interact with what's shown here?",
-            "Are there any potential risks or benefits related to this scene?",
-            "What might this image make someone feel, and why?"
-        ]
+        "class_identification": {
+            "with_label": [
+                f"Is this a {class_name}? Describe its features.",
+                f"This image shows a {class_name}. Can you describe its characteristics?",
+                f"What are the distinctive features of this {class_name}?",
+                f"How would you recognize a {class_name} from its appearance?",
+                f"Identify this {class_name} and list its main traits.",
+                f"What details confirm this is a {class_name}?"
+            ],
+            "without_label": [
+                "What object is shown in this image? Describe its features.",
+                "Can you describe the main characteristics of the object in this image?",
+                "What distinctive features can you identify in this image?",
+                "How would you recognize the object based on its appearance?"
+            ]
+        },
+        "detailed_description": {
+            "with_label": [
+                f"What does this {class_name} look like?",
+                f"Describe the appearance of this {class_name}.",
+                f"What are the main colors and shapes of this {class_name}?",
+                f"How is this {class_name} positioned in the image?",
+                f"What textures or patterns do you observe on this {class_name}?",
+                f"Give a detailed visual description of this {class_name}."
+            ],
+            "without_label": [
+                "What does the object in the image look like?",
+                "Describe the appearance of the object in this image.",
+                "What are the main colors and shapes in the image?",
+                "What textures or patterns can you see in this image?"
+            ]
+        },
+        "complex_reasoning": {
+            "with_label": [
+                f"What is the typical function or purpose of a {class_name}?",
+                f"How do people interact with a {class_name}?",
+                f"What makes this {class_name} stand out compared to similar objects?",
+                f"In what environments would you usually find a {class_name}?",
+                f"What interesting facts do you know about {class_name}s?",
+                f"Why is a {class_name} considered important in its context?"
+            ],
+            "without_label": [
+                "What is the function or purpose of the object shown?",
+                "How might people typically interact with the object in this image?",
+                "What makes the object in this image unique?",
+                "In what settings would you commonly find this kind of object?"
+            ]
+        }
     }
     
-    # Create a conversation structure
+    # Merge the with_label and without_label prompts into one list for each category.
+    for category in conversation_templates:
+        with_label = conversation_templates[category]["with_label"]
+        without_label = conversation_templates[category]["without_label"]
+        conversation_templates[category] = with_label + without_label  # Total 10 prompts per category.
+    
+    # Build the overall pool of prompts from all categories.
+    overall_pool = []
+    for cat in conversation_templates:
+        overall_pool.extend([(cat, q) for q in conversation_templates[cat]])
+    
     conversation = []
     
-    # Select questions for this image
-    selected_questions = []
+    # Default anchor question with fallback.
+    default_first_question = (
+        f"Based on the CIFAR‑10 label, this image should depict a {class_name}. "
+        f"Could you confirm this and describe its features?"
+    )
     
-    # First, select one question from each category
-    for category, questions in conversation_templates.items():
-        selected_questions.append((category, random.choice(questions)))
+    def is_uncertain_or_mismatch(answer_text, true_label):
+        """Check if the answer indicates uncertainty or references a different class."""
+        lower = answer_text.lower()
+        dynamic_keyword = f"it is not {true_label}".lower()
+        uncertain_keywords = [
+            "not sure", "unclear", "can't tell", "cannot tell",
+            "i'm sorry", "i cannot", "i can't", dynamic_keyword
+        ]
+        if any(kw in lower for kw in uncertain_keywords):
+            return True
+        for c in cifar10_classes:
+            if c != true_label and c in lower:
+                return True
+        return False
     
-    # Create a pool of all remaining questions
-    all_remaining_questions = []
-    for category, questions in conversation_templates.items():
-        for question in questions:
-            if not any(q[1] == question for q in selected_questions):
-                all_remaining_questions.append((category, question))
+    def fallback_response(label):
+        """Return a hard-coded fallback response that confirms the correct class label."""
+        return f"Yes, this is a {label}. It shows the typical characteristics of a {label}."
     
-    # Randomly select 2 more questions from the remaining pool
-    additional_questions = random.sample(all_remaining_questions, 2)
-    selected_questions.extend(additional_questions)
-    
-    # Shuffle the questions to mix up the order
-    random.shuffle(selected_questions)
-    
-    # Process each selected question
-    for category, question in selected_questions:
+    def ask_question(question_text, use_fallback=True):
+        """Send a prompt and return the answer.
+           If use_fallback is True, check for uncertainty and apply fallback.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": question_text},
+                ]
+            },
+        ]
         try:
-            # Format messages for SmolVLM 2
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": question},
-                    ]
-                },
-            ]
-            
-            # Apply chat template
             inputs = processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -167,7 +210,6 @@ def generate_conversation_data(model, processor, image, class_name):
                 return_tensors="pt",
             ).to(model.device, dtype=torch.float16)
             
-            # Generate with the model
             with torch.no_grad():
                 generated_ids = model.generate(
                     **inputs, 
@@ -177,32 +219,54 @@ def generate_conversation_data(model, processor, image, class_name):
                     max_new_tokens=300
                 )
             
-            # Decode the output
-            answer = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True,
-            )[0]
+            raw_answer = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            if "User:" in raw_answer:
+                raw_answer = raw_answer.split("User:")[-1].strip()
+            if "Assistant:" in raw_answer:
+                raw_answer = raw_answer.split("Assistant:")[-1].strip()
             
-            # Clean up the answer - remove any "User:" or "Assistant:" prefixes
-            if "User:" in answer:
-                answer = answer.split("User:")[-1].strip()
-            if "Assistant:" in answer:
-                answer = answer.split("Assistant:")[-1].strip()
+            if use_fallback and is_uncertain_or_mismatch(raw_answer, class_name):
+                return fallback_response(class_name)
+            else:
+                return raw_answer
             
-            # Add to conversation
-            conversation.append({
-                "human": question,
-                "assistant": answer
-            })
-            
-        except Exception as e:
-            # Silently handle errors to avoid cluttering the output
-            conversation.append({
-                "human": question,
-                "assistant": f"I apologize, but I couldn't analyze this image properly."
-            })
+        except Exception:
+            return fallback_response(class_name) if use_fallback else ""
+    
+    # 1) Ask the first (anchor) question with fallback.
+    first_answer = ask_question(default_first_question, use_fallback=True)
+    conversation.append({
+        "human": default_first_question,
+        "assistant": first_answer
+    })
+    
+    # 2) Select 3 random questions (one per category).
+    selected_questions = []
+    for category in conversation_templates:
+        q = random.choice(conversation_templates[category])
+        selected_questions.append((category, q))
+    
+    # 3) Select 2 additional random questions from the overall pool (avoiding duplicates).
+    already_selected = set(q for _, q in selected_questions)
+    extra_candidates = [entry for entry in overall_pool if entry[1] not in already_selected]
+    extra_questions = random.sample(extra_candidates, 2) if len(extra_candidates) >= 2 else extra_candidates
+    
+    # Merge the additional questions to have 5 in total.
+    combined_questions = selected_questions + extra_questions
+    random.shuffle(combined_questions)
+    
+    # 4) Process each additional question WITHOUT fallback.
+    for category, question in combined_questions:
+        answer = ask_question(question, use_fallback=False)
+        conversation.append({
+            "human": question,
+            "assistant": answer
+        })
     
     return conversation
+
+
+
 
 def save_conversation_to_file(image, class_name, conversation, index, output_dir="llava_dataset"):
     """Save the conversation data to a file in a format similar to LLaVA-Instruct-150k."""
@@ -305,7 +369,7 @@ def main():
     all_data = []
     
     # Process CIFAR-10 images
-    num_images = 1000  # Aim for 1000+ images for a decent dataset
+    num_images = 100  # Aim for 1000+ images for a decent dataset
     
     # Create a tqdm progress bar
     pbar = tqdm(range(num_images), desc="Processing CIFAR-10 images", unit="image")
@@ -341,7 +405,7 @@ def main():
             })
             
             # Save progress every 10 images for testing, or 100 for production
-            if (i+1) % 500 == 0:
+            if (i+1) % 10 == 0:
                 save_dataset(output_dir, all_data)
                 
         except Exception as e:
