@@ -9,13 +9,14 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoProcessor
 import wandb
 import numpy as np
 from dataloader import create_dataloaders
+import torch.nn.functional as F
 
 # Configuration
 CONFIG = {
     # Model parameters
     "SIGLIP_MODEL": "google/siglip-so400m-patch14-384",
     "PHI_MODEL": "microsoft/phi-3-mini-4k-instruct",
-    "PROJECTION_DIM": 2048,
+    "PROJECTION_DIM": 4096,
     "PROJECTION_LAYERS": 2,  # Number of layers in projection MLP
     "ACTIVATION": "gelu",    # Activation function in projection MLP
     
@@ -23,7 +24,7 @@ CONFIG = {
     "BATCH_SIZE": 16,
     "LEARNING_RATE": 1e-4,
     "WEIGHT_DECAY": 0.01,
-    "EPOCHS": 20,
+    "EPOCHS": 30,
     "SAVE_EVERY": 1,
     
     # Optimizer parameters
@@ -198,7 +199,9 @@ def train_epoch(model, train_loader, optimizer, scaler, loss_fn, device):
     """Train for one epoch."""
     model.train()
     total_loss = 0
-    
+    total_cosine = 0.0  # Initialize total_cosine
+    num_batches = 0     # Initialize num_batches
+
     progress_bar = tqdm(train_loader, desc="Training")
     for batch in progress_bar:
         # Move data to device
@@ -221,47 +224,69 @@ def train_epoch(model, train_loader, optimizer, scaler, loss_fn, device):
                 attention_mask
             )
             
+            # Normalize embeddings for cosine similarity
+            projected_norm = torch.nn.functional.normalize(projected_embeddings, p=2, dim=-1)
+            target_norm = torch.nn.functional.normalize(target_embeddings, p=2, dim=-1)
+            
             # Compute loss
-            loss = compute_loss(projected_embeddings, target_embeddings, loss_fn)
+            loss = compute_loss(projected_norm, target_norm, loss_fn)
+            
+        # Compute cosine similarity for logging.
+        # F.cosine_similarity returns a value per sample; take mean for the batch.
+        batch_cosine = F.cosine_similarity(projected_norm, target_norm, dim=-1).mean().item()
         
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         
-        # Update progress
+        # Update accumulators
         total_loss += loss.item()
-        progress_bar.set_postfix({"loss": loss.item()})
-    
-    return total_loss / len(train_loader)
+        total_cosine += batch_cosine
+        num_batches += 1
+        
+        progress_bar.set_postfix({"loss": loss.item(), "cosine": f"{batch_cosine:.4f}"})
+        
+    avg_loss = total_loss / len(train_loader)
+    avg_cosine = total_cosine / num_batches if num_batches > 0 else 0
+    return avg_loss, avg_cosine
 
 def validate(model, val_loader, loss_fn, device):
-    """Validate the model."""
+    """Validate the model and log average loss and cosine similarity."""
     model.eval()
     total_loss = 0
+    total_cosine = 0
+    num_batches = 0
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validation"):
-            # Move data to device
+            # Move data to device.
             images = batch["image"].to(device)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             
-            # Get projected embeddings
+            # Obtain embeddings.
             projected_embeddings = model(images)
+            target_embeddings = extract_phi_embeddings(model.phi, input_ids, attention_mask)
             
-            # Get target Phi-3 embeddings
-            target_embeddings = extract_phi_embeddings(
-                model.phi, 
-                input_ids, 
-                attention_mask
-            )
+            # Normalize both embeddings.
+            projected_norm = torch.nn.functional.normalize(projected_embeddings, p=2, dim=-1)
+            target_norm = torch.nn.functional.normalize(target_embeddings, p=2, dim=-1)
             
-            # Compute loss
-            loss = compute_loss(projected_embeddings, target_embeddings, loss_fn)
+            # Compute validation loss on normalized embeddings.
+            loss = loss_fn(projected_norm, target_norm)
             total_loss += loss.item()
+            
+            # Compute the cosine similarity for the batch.
+            batch_cosine = F.cosine_similarity(projected_norm, target_norm, dim=-1).mean().item()
+            total_cosine += batch_cosine
+            num_batches += 1
     
-    return total_loss / len(val_loader)
+    avg_loss = total_loss / len(val_loader)
+    avg_cosine = total_cosine / num_batches if num_batches > 0 else 0
+    print(f"Validation Loss: {avg_loss:.4f}, Avg Cosine Similarity: {avg_cosine:.4f}")
+    return avg_loss, avg_cosine
+
 
 def main(args):
     # Print configuration
@@ -273,12 +298,6 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Initialize wandb if enabled
-    if args.use_wandb:
-        wandb.init(
-            project="siglip-phi3-projection",
-            config=vars(args)
-        )
     
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(
@@ -359,7 +378,7 @@ def main(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Training loop
+    # Training loop with logging of cosine similarity.
     best_val_loss = float('inf')
     
     print(f"Starting training for {args.epochs} epochs")
@@ -367,26 +386,29 @@ def main(args):
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1}/{args.epochs}")
         
-        # Train
-        train_loss = train_epoch(model, train_loader, optimizer, scaler, loss_fn, device)
+        # Train: now returning both loss and average cosine similarity.
+        train_loss, train_cosine = train_epoch(model, train_loader, optimizer, scaler, loss_fn, device)
         
-        # Validate
-        val_loss = validate(model, val_loader, loss_fn, device)
+        # Validate with logging of cosine similarity.
+        val_loss, val_cosine = validate(model, val_loader, loss_fn, device)
         
-        # Update learning rate
+        # Step learning rate scheduler.
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
-        # Log metrics
-        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
+        # Log metrics.
+        print(f"Train Loss: {train_loss:.4f}, Train Cosine: {train_cosine:.4f}")
+        print(f"Val Loss: {val_loss:.4f}, Val Cosine: {val_cosine:.4f}, LR: {current_lr:.6f}")
         if args.use_wandb:
             wandb.log({
                 "train_loss": train_loss,
+                "train_cosine_similarity": train_cosine,
                 "val_loss": val_loss,
+                "val_cosine_similarity": val_cosine,
                 "learning_rate": current_lr
             })
         
-        # Save best model
+        # Save best model checkpoint.
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
@@ -397,7 +419,7 @@ def main(args):
             }, os.path.join(args.output_dir, "best_model.pt"))
             print(f"Saved best model with validation loss: {val_loss:.4f}")
         
-        # Save checkpoint
+        # Save checkpoint every save_every epochs.
         if (epoch + 1) % args.save_every == 0:
             torch.save({
                 "epoch": epoch,
@@ -406,7 +428,7 @@ def main(args):
                 "val_loss": val_loss
             }, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt"))
     
-    # Save final model
+    # Save final model.
     torch.save({
         "epoch": args.epochs - 1,
         "model_state_dict": model.projection.state_dict(),
@@ -419,50 +441,112 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SigLIP to Phi-3 projection layer")
-    
-    # Model arguments
-    parser.add_argument("--siglip_model_name", type=str, default=CONFIG["SIGLIP_MODEL"],
-                        help="Name of the SigLIP model")
-    parser.add_argument("--phi_model_name", type=str, default=CONFIG["PHI_MODEL"],
-                        help="Name of the Phi-3 model")
-    parser.add_argument("--projection_dim", type=int, default=CONFIG["PROJECTION_DIM"],
-                        help="Dimension of the projection layer")
-    parser.add_argument("--projection_layers", type=int, default=CONFIG["PROJECTION_LAYERS"],
-                        help="Number of layers in projection MLP")
-    
-    # Data arguments
-    parser.add_argument("--data_dir", type=str, default=CONFIG["DATA_DIR"],
-                        help="Directory containing the dataset")
-    parser.add_argument("--batch_size", type=int, default=CONFIG["BATCH_SIZE"],
-                        help="Batch size for training")
-    parser.add_argument("--num_workers", type=int, default=CONFIG["NUM_WORKERS"],
-                        help="Number of workers for data loading")
-    
-    # Training arguments
-    parser.add_argument("--epochs", type=int, default=CONFIG["EPOCHS"],
-                        help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=CONFIG["LEARNING_RATE"],
-                        help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=CONFIG["WEIGHT_DECAY"],
-                        help="Weight decay")
-    parser.add_argument("--save_every", type=int, default=CONFIG["SAVE_EVERY"],
-                        help="Save checkpoint every N epochs")
-    parser.add_argument("--optimizer", type=str, default=CONFIG["OPTIMIZER"],
-                        help="Optimizer to use (adamw, adam)")
-    parser.add_argument("--scheduler", type=str, default=CONFIG["SCHEDULER"],
-                        help="Learning rate scheduler (cosine, linear)")
-    parser.add_argument("--lr_min_factor", type=float, default=CONFIG["LR_MIN_FACTOR"],
-                        help="Minimum learning rate factor")
-    parser.add_argument("--loss_function", type=str, default=CONFIG["LOSS_FUNCTION"],
-                        help="Loss function (mse, l1, smoothl1)")
-    parser.add_argument("--use_mixed_precision", action="store_true", default=CONFIG["USE_MIXED_PRECISION"],
-                        help="Whether to use mixed precision training")
-    
-    # Output arguments
-    parser.add_argument("--output_dir", type=str, default=CONFIG["OUTPUT_DIR"],
-                        help="Directory to save models")
-    parser.add_argument("--use_wandb", action="store_true", default=CONFIG["USE_WANDB"],
-                        help="Whether to use Weights & Biases for logging")
-    
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="cifar10_vlm_dataset",
+        help="Directory containing the dataset (with train.json/val.json)"
+    )
+    parser.add_argument(
+        "--siglip_model_name",
+        type=str,
+        default="google/siglip-so400m-patch14-384",
+        help="Name of the SigLIP model"
+    )
+    parser.add_argument(
+        "--phi_model_name",
+        type=str,
+        default="microsoft/phi-3-mini-4k-instruct",
+        help="Name of the Phi-3 model"
+    )
+    parser.add_argument(
+        "--projection_dim",
+        type=int,
+        default=4096,
+        help="Projection dimension for the intermediate layer"
+    )
+    parser.add_argument(
+        "--projection_layers",
+        type=int,
+        default=2,
+        help="Number of layers in the projection MLP"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size for training"
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of workers for dataloader"
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate for training"
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.01,
+        help="Weight decay for optimizer"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=1,
+        help="Save checkpoint every N epochs"
+    )
+    parser.add_argument(
+        "--lr_min_factor",
+        type=float,
+        default=0.01,
+        help="Minimum learning rate factor"
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        help="Optimizer to use"
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="cosine",
+        help="Learning rate scheduler to use"
+    )
+    parser.add_argument(
+        "--loss_function",
+        type=str,
+        default="mse",
+        help="Loss function to use"
+    )
+    parser.add_argument(
+        "--use_mixed_precision",
+        action="store_true",
+        help="Use mixed precision training"
+    )
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="Use Weights and Biases for logging"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="siglip_phi3_projection",
+        help="Output directory for model checkpoints and logs"
+    )
+
     args = parser.parse_args()
-    main(args) 
+    main(args)

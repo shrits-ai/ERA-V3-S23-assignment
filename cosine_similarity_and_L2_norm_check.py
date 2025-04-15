@@ -14,24 +14,23 @@ from train_projection import SigLIPProjectionModel, extract_phi_embeddings, CONF
 # Import the AutoTokenizer from transformers.
 from transformers import AutoTokenizer
 
-# Import the config from dataloader
-from dataloader import CONFIG as DATALOADER_CONFIG
-
 def process_sample(image_path, prompt, model, tokenizer, device):
     """
     Process a single image and prompt to compute cosine similarity and L2 norms.
-    
+
     Args:
         image_path (str): Path to the image file.
         prompt (str): Text prompt (should include the correct class label).
         model: The SigLIPProjectionModel instance.
         tokenizer: The tokenizer for the Phi‑3 model.
         device (str): Device to run the computations.
-    
+
     Returns:
         dict: Dictionary containing 'cosine_similarity', 'image_norm', 'text_norm'.
     """
-    # Preprocess the image using a basic transform (matches the sample script)
+    # Preprocess the image using the appropriate transform.
+    # Here we resize and normalize the image so that it matches the expected input size.
+    from dataloader import CONFIG as DATALOADER_CONFIG  # import expected normalization config
     transform = transforms.Compose([
         transforms.Resize((DATALOADER_CONFIG["IMAGE_SIZE"], DATALOADER_CONFIG["IMAGE_SIZE"])),
         transforms.ToTensor(),
@@ -50,9 +49,13 @@ def process_sample(image_path, prompt, model, tokenizer, device):
     # Retrieve text embeddings using the extract_phi_embeddings helper.
     text_embedding = extract_phi_embeddings(model.phi, encoded["input_ids"], encoded["attention_mask"])
 
-    # Compute cosine similarity between the two embeddings.
-    cosine_sim = F.cosine_similarity(image_embedding, text_embedding, dim=-1).item()
-    # Compute L2 norms (magnitudes) for image and text embeddings.
+    # Normalize both image and text embeddings.
+    normalized_image_embedding = F.normalize(image_embedding, p=2, dim=-1)
+    normalized_text_embedding = F.normalize(text_embedding, p=2, dim=-1)
+
+    # Compute cosine similarity between the normalized embeddings.
+    cosine_sim = F.cosine_similarity(normalized_image_embedding, normalized_text_embedding, dim=-1).item()
+    # Compute L2 norms (magnitudes) for image and text embeddings (from the original embeddings).
     image_norm = torch.norm(image_embedding, p=2).item()
     text_norm = torch.norm(text_embedding, p=2).item()
 
@@ -92,6 +95,15 @@ def main(args):
         print("No data found in JSON file.")
         return
 
+    # Load checkpoint (if available)
+    checkpoint_path = "siglip_phi3_projection/best_model.pt"  # change this as needed
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.projection.load_state_dict(checkpoint["model_state_dict"])
+        print(f"Loaded checkpoint weights from {checkpoint_path}")
+    else:
+        print("Checkpoint not found; using freshly initialized weights.")
+
     # Process up to the requested number of images.
     num_samples = min(args.num_images, len(data))
     total_cosine = 0.0
@@ -124,7 +136,7 @@ def main(args):
 
     print("\nResults:")
     print(f"Processed {num_samples} samples from the dataset.")
-    print(f"Average Cosine Similarity: {avg_cosine:.4f}")
+    print(f"Average Cosine Similarity (normalized): {avg_cosine:.4f}")
     print(f"Average Image Embedding Norm: {avg_image_norm:.4f}")
     print(f"Average Text Embedding Norm: {avg_text_norm:.4f}")
 
@@ -149,7 +161,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_images",
         type=int,
-        default=100,
+        default=1000,
         help="Number of images to process"
     )
     parser.add_argument(
