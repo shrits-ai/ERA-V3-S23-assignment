@@ -450,6 +450,7 @@ def main(args):
             model, 
             train_loader, 
             optimizer, 
+            scheduler,
             scaler, 
             device, 
             gradient_accumulation_steps=args.gradient_accumulation_steps,
