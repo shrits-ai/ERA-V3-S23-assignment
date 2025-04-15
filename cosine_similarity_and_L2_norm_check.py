@@ -14,6 +14,9 @@ from train_projection import SigLIPProjectionModel, extract_phi_embeddings, CONF
 # Import the AutoTokenizer from transformers.
 from transformers import AutoTokenizer
 
+# Import the config from dataloader
+from dataloader import CONFIG as DATALOADER_CONFIG
+
 def process_sample(image_path, prompt, model, tokenizer, device):
     """
     Process a single image and prompt to compute cosine similarity and L2 norms.
@@ -29,7 +32,12 @@ def process_sample(image_path, prompt, model, tokenizer, device):
         dict: Dictionary containing 'cosine_similarity', 'image_norm', 'text_norm'.
     """
     # Preprocess the image using a basic transform (matches the sample script)
-    transform = transforms.ToTensor()
+    transform = transforms.Compose([
+        transforms.Resize((DATALOADER_CONFIG["IMAGE_SIZE"], DATALOADER_CONFIG["IMAGE_SIZE"])),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=DATALOADER_CONFIG["NORMALIZE_MEAN"],
+                             std=DATALOADER_CONFIG["NORMALIZE_STD"])
+    ])
     image = Image.open(image_path).convert("RGB")
     image_tensor = transform(image).unsqueeze(0).to(device)
 
