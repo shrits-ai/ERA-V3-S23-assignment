@@ -37,7 +37,7 @@ CONFIG = {
     
     # Training parameters
     "BATCH_SIZE": 8,
-    "LEARNING_RATE": 2e-4,
+    "LEARNING_RATE": 2e-5,
     "WEIGHT_DECAY": 0.01,
     "EPOCHS": 5,
     "SAVE_EVERY": 1,
@@ -54,8 +54,8 @@ CONFIG = {
     "COMPUTE_DTYPE": torch.bfloat16, # Define compute dtype centrally (bfloat16 recommended for Ampere+)
     
     # Data parameters
-    "DATA_DIR": "cifar10_vlm_dataset",
-    "NUM_WORKERS": 4,
+    "DATA_DIR": "stl10_vlm_dataset_final",
+    "NUM_WORKERS": 16,
     
     # Output parameters
     "OUTPUT_DIR": "phi3_qlora_adapter",

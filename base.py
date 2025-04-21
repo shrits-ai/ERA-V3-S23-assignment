@@ -1,420 +1,297 @@
+# -*- coding: utf-8 -*-
+"""
+Generates multimodal conversation dataset using a VLM.
+MODIFIED VERSION: Uses STL-10 (default) or CIFAR-10, runs in parallel across GPUs,
+and uses the simpler 5-question generation logic from the reference script.
+Minimal quality filtering. Saves partial datasets per process.
+Corrected processor call to avoid TypeError.
+"""
+
 import os
 import tempfile
 import torch
 import torchvision
 import torchvision.transforms as transforms
 from PIL import Image
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt # Not needed for parallel run display
 from transformers import AutoProcessor, AutoModelForImageTextToText
 import numpy as np
 import json
 import random
 from tqdm import tqdm
+import argparse # For command-line arguments
+import traceback # For detailed error printing
 
-# Create a temporary directory in the user's home directory
+# --- Configuration ---
+# Define the base path on the larger drive for dataset downloads
+BASE_DATA_PATH = "/opt/dlami/nvme/ERA-V3-S23-assignment/torchvision_datasets" # MODIFIED
+# VLM Model to use
+VLM_MODEL_PATH = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+
+# --- Directory Setup ---
+# Setup temp dir (optional)
 temp_dir = os.path.join(os.path.expanduser("~"), "temp")
 os.makedirs(temp_dir, exist_ok=True)
 os.environ["TMPDIR"] = temp_dir
 os.environ["TEMP"] = temp_dir
 os.environ["TMP"] = temp_dir
+# Setup HuggingFace cache dir
+hf_cache_dir = os.path.join(os.path.expanduser("~"), "hf_cache")
+os.environ["TRANSFORMERS_CACHE"] = hf_cache_dir
+os.makedirs(hf_cache_dir, exist_ok=True)
+print(f"HuggingFace cache set to: {hf_cache_dir}")
 
-# Set the cache directory for Hugging Face to a location with sufficient space
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(os.path.expanduser("~"), "hf_cache")
-os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
+# --- Dataset Function (Selectable Dataset, Saves to BASE_DATA_PATH) ---
+def download_dataset(dataset_name='stl10'):
+    """Downloads STL10 or CIFAR10 to BASE_DATA_PATH and returns trainset, classes."""
+    transform = transforms.Compose([transforms.ToTensor()])
+    dataset_root = os.path.join(BASE_DATA_PATH, dataset_name.lower()) # Use BASE_DATA_PATH
+    print(f"Using {dataset_name.upper()} dataset from: {dataset_root}")
+    os.makedirs(dataset_root, exist_ok=True) # Ensure root exists
 
-def download_cifar10():
-    """Download CIFAR-10 dataset and return the train loader."""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    
-    # Download and load CIFAR-10
-    trainset = torchvision.datasets.CIFAR10(
-        root='./data', 
-        train=True,
-        download=True, 
-        transform=transform
-    )
-    
-    trainloader = torch.utils.data.DataLoader(
-        trainset, 
-        batch_size=1,
-        shuffle=True
-    )
-    
-    # Class names for CIFAR-10
-    classes = ('airplane', 'automobile', 'bird', 'cat', 'deer',
-               'dog', 'frog', 'horse', 'ship', 'truck')
-    
-    return trainloader, classes
+    if dataset_name.lower() == 'stl10':
+        # Download/Load STL-10 train split
+        full_trainset = torchvision.datasets.STL10(root=dataset_root, split='train', download=True, transform=transform)
+        classes = ('airplane', 'bird', 'car', 'cat', 'deer', 'dog', 'horse', 'monkey', 'ship', 'truck')
+    elif dataset_name.lower() == 'cifar10':
+        # Download/Load CIFAR-10 train split
+        full_trainset = torchvision.datasets.CIFAR10(root=dataset_root, train=True, download=True, transform=transform)
+        classes = ('airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}. Choose 'stl10' or 'cifar10'.")
+    # Return trainset, not dataloader
+    return full_trainset, classes
 
-def load_single_image(trainloader):
-    """Load a single image from the CIFAR-10 dataset."""
-    # Get a single batch
-    dataiter = iter(trainloader)
-    images, labels = next(dataiter)
-    
-    # Convert tensor to PIL Image
-    image = images[0].permute(1, 2, 0).numpy()
-    image = (image * 255).astype(np.uint8)
-    pil_image = Image.fromarray(image)
-    
-    print(f"Image size: {pil_image.size}")
-    
-    # Save the original image for debugging
-    pil_image.save("original_image.png")
-    
-    return pil_image, labels[0].item()
+# --- VLM Loading Function (Loads to specified GPU) ---
+def load_vlm_model(gpu_id):
+    """Loads VLM model onto specified GPU."""
+    device = torch.device(f"cuda:{gpu_id}") # Use specific GPU
+    print(f"Loading model '{VLM_MODEL_PATH}' onto {device}...")
+    processor = AutoProcessor.from_pretrained(VLM_MODEL_PATH)
+    try:
+         # Try direct loading to device
+         model = AutoModelForImageTextToText.from_pretrained(
+             VLM_MODEL_PATH, torch_dtype=torch.float16, device_map={'': device})
+    except Exception:
+         # Fallback to loading on CPU then moving
+         print("Direct device_map failed, loading to CPU then moving.")
+         model = AutoModelForImageTextToText.from_pretrained(
+             VLM_MODEL_PATH, torch_dtype=torch.float16).to(device)
+    model.eval() # Set to evaluation mode
+    print(f"Model loaded successfully on {device}.")
+    # Return device along with model and processor
+    return model, processor, device
 
-def load_vlm_model():
-    """Load SmolVLM 2 model for detailed image descriptions."""
-    model_path = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
-    
-    processor = AutoProcessor.from_pretrained(model_path)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,  # Using float16 instead of bfloat16 for wider compatibility
-    ).to("cuda")
-    
-    return model, processor
-
-import random
-import torch
-
-def generate_conversation_data(model, processor, image, class_name):
-    """
-    Generate conversational data with a robust fallback for the first question only.
-    
-    The conversation includes:
-      1) A default anchor question that enforces the CIFAR‑10 label with fallback if uncertain.
-      2) 5 additional questions (3, one from each category; and 2 extra chosen overall)
-         without any fallback mechanism.
-    """
-    image.save("model_input_image.png")
-    
-    # Known CIFAR-10 classes for reference.
-    cifar10_classes = [
-        "airplane", "automobile", "bird", "cat", "deer",
-        "dog", "frog", "horse", "ship", "truck"
-    ]
-    
-    # Prompt pools: each category has prompts with and without label.
+# --- Conversation Generation Function (Simpler Logic + Corrected Processor Call) ---
+def generate_conversation_data(model, processor, image, class_name, device): # Added device
+    """Generate ~5 conversational turns based on the reference script's logic."""
+    # Define conversation templates (original simpler version)
     conversation_templates = {
-        "class_identification": {
-            "with_label": [
-                f"Is this a {class_name}? Describe its features.",
-                f"This image shows a {class_name}. Can you describe its characteristics?",
-                f"What are the distinctive features of this {class_name}?",
-                f"How would you recognize a {class_name} from its appearance?",
-                f"Identify this {class_name} and list its main traits.",
-                f"What details confirm this is a {class_name}?"
-            ],
-            "without_label": [
-                "What object is shown in this image? Describe its features.",
-                "Can you describe the main characteristics of the object in this image?",
-                "What distinctive features can you identify in this image?",
-                "How would you recognize the object based on its appearance?"
-            ]
-        },
-        "detailed_description": {
-            "with_label": [
-                f"What does this {class_name} look like?",
-                f"Describe the appearance of this {class_name}.",
-                f"What are the main colors and shapes of this {class_name}?",
-                f"How is this {class_name} positioned in the image?",
-                f"What textures or patterns do you observe on this {class_name}?",
-                f"Give a detailed visual description of this {class_name}."
-            ],
-            "without_label": [
-                "What does the object in the image look like?",
-                "Describe the appearance of the object in this image.",
-                "What are the main colors and shapes in the image?",
-                "What textures or patterns can you see in this image?"
-            ]
-        },
-        "complex_reasoning": {
-            "with_label": [
-                f"What is the typical function or purpose of a {class_name}?",
-                f"How do people interact with a {class_name}?",
-                f"What makes this {class_name} stand out compared to similar objects?",
-                f"In what environments would you usually find a {class_name}?",
-                f"What interesting facts do you know about {class_name}s?",
-                f"Why is a {class_name} considered important in its context?"
-            ],
-            "without_label": [
-                "What is the function or purpose of the object shown?",
-                "How might people typically interact with the object in this image?",
-                "What makes the object in this image unique?",
-                "In what settings would you commonly find this kind of object?"
-            ]
-        }
+        "conversational": [ "What's happening here?", "Can you describe what's in this picture?", "What do you notice first in this image?", "Is this image interesting or unusual?", "What catches your attention in this scene?", "What stands out the most?", "Can you tell me more about this scene?", "Does this image look familiar to you?" ],
+        "detailed_description": [ "What objects are present in the image?", "What are the main colors and shapes in this image?", "Describe the scene in as much detail as possible.", "How is the object positioned in the image?", "What textures or surfaces can you observe?", "Describe the background and the foreground.", "Are there any patterns or repeating elements?", "Is the object in motion or still?" ],
+        "complex_reasoning": [ "What could be the function of the object in this image?", "Why might someone be interested in this image?", "What might be happening just outside the frame?", "What could this image tell us about the environment it was taken in?", "What might this object or scene be used for?", "How could someone interact with what's shown here?", "Are there any potential risks or benefits related to this scene?", "What might this image make someone feel, and why?" ]
     }
-    
-    # Merge the with_label and without_label prompts into one list for each category.
-    for category in conversation_templates:
-        with_label = conversation_templates[category]["with_label"]
-        without_label = conversation_templates[category]["without_label"]
-        conversation_templates[category] = with_label + without_label  # Total 10 prompts per category.
-    
-    # Build the overall pool of prompts from all categories.
-    overall_pool = []
-    for cat in conversation_templates:
-        overall_pool.extend([(cat, q) for q in conversation_templates[cat]])
-    
-    conversation = []
-    
-    # Default anchor question with fallback.
-    default_first_question = (
-        f"Based on the CIFAR‑10 label, this image should depict a {class_name}. "
-        f"Could you confirm this and describe its features?"
-    )
-    
-    def is_uncertain_or_mismatch(answer_text, true_label):
-        """Check if the answer indicates uncertainty or references a different class."""
-        lower = answer_text.lower()
-        dynamic_keyword = f"it is not {true_label}".lower()
-        uncertain_keywords = [
-            "not sure", "unclear", "can't tell", "cannot tell",
-            "i'm sorry", "i cannot", "i can't", dynamic_keyword
-        ]
-        if any(kw in lower for kw in uncertain_keywords):
-            return True
-        for c in cifar10_classes:
-            if c != true_label and c in lower:
-                return True
-        return False
-    
-    def fallback_response(label):
-        """Return a hard-coded fallback response that confirms the correct class label."""
-        return f"Yes, this is a {label}. It shows the typical characteristics of a {label}."
-    
-    def ask_question(question_text, use_fallback=True):
-        """Send a prompt and return the answer.
-           If use_fallback is True, check for uncertainty and apply fallback.
-        """
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": question_text},
-                ]
-            },
-        ]
+
+    conversation = [] # Holds {"human": ..., "assistant": ...} dicts
+    selected_questions = []
+
+    # Select one question from each category
+    for category, questions in conversation_templates.items():
+        if questions: # Check if list is not empty
+            selected_questions.append((category, random.choice(questions)))
+
+    # Create a pool of all remaining questions
+    all_remaining_questions = []
+    selected_q_texts = {q[1] for q in selected_questions}
+    for category, questions in conversation_templates.items():
+        for question in questions:
+            if question not in selected_q_texts:
+                 all_remaining_questions.append((category, question))
+
+    # Randomly select 2 more unique questions if possible
+    num_needed = 5 - len(selected_questions) # Aim for 5 total turns
+    if num_needed > 0 and all_remaining_questions:
+        num_to_sample = min(num_needed, len(all_remaining_questions))
+        additional_questions = random.sample(all_remaining_questions, num_to_sample)
+        selected_questions.extend(additional_questions)
+
+    random.shuffle(selected_questions) # Shuffle the final set of questions
+
+    # Process each selected question
+    for category, question in selected_questions:
         try:
+            messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": question}]}]
+            rgb_image = image.convert("RGB") if image.mode != "RGB" else image # Ensure RGB
+
+            # --- CORRECTED PROCESSOR CALL ---
             inputs = processor.apply_chat_template(
-                messages,
+                messages, # Processor finds the image inside messages
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
-                return_tensors="pt",
-            ).to(model.device, dtype=torch.float16)
-            
+                return_tensors="pt"
+                # NO explicit images=rgb_image kwarg here
+            ).to(device, dtype=torch.float16) # <-- Use passed device
+            # --- END CORRECTION ---
+
             with torch.no_grad():
                 generated_ids = model.generate(
-                    **inputs, 
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    max_new_tokens=300
+                    **inputs, do_sample=True, temperature=0.7, top_p=0.9, max_new_tokens=300,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                    eos_token_id=processor.tokenizer.eos_token_id
                 )
-            
-            raw_answer = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            if "User:" in raw_answer:
-                raw_answer = raw_answer.split("User:")[-1].strip()
-            if "Assistant:" in raw_answer:
-                raw_answer = raw_answer.split("Assistant:")[-1].strip()
-            
-            if use_fallback and is_uncertain_or_mismatch(raw_answer, class_name):
-                return fallback_response(class_name)
-            else:
-                return raw_answer
-            
-        except Exception:
-            return fallback_response(class_name) if use_fallback else ""
-    
-    # 1) Ask the first (anchor) question with fallback.
-    first_answer = ask_question(default_first_question, use_fallback=True)
-    conversation.append({
-        "human": default_first_question,
-        "assistant": first_answer
-    })
-    
-    # 2) Select 3 random questions (one per category).
-    selected_questions = []
-    for category in conversation_templates:
-        q = random.choice(conversation_templates[category])
-        selected_questions.append((category, q))
-    
-    # 3) Select 2 additional random questions from the overall pool (avoiding duplicates).
-    already_selected = set(q for _, q in selected_questions)
-    extra_candidates = [entry for entry in overall_pool if entry[1] not in already_selected]
-    extra_questions = random.sample(extra_candidates, 2) if len(extra_candidates) >= 2 else extra_candidates
-    
-    # Merge the additional questions to have 5 in total.
-    combined_questions = selected_questions + extra_questions
-    random.shuffle(combined_questions)
-    
-    # 4) Process each additional question WITHOUT fallback.
-    for category, question in combined_questions:
-        answer = ask_question(question, use_fallback=False)
-        conversation.append({
-            "human": question,
-            "assistant": answer
-        })
-    
+
+            input_token_len = inputs['input_ids'].shape[1]
+            generated_part = generated_ids[:, input_token_len:]
+            answer = processor.batch_decode(generated_part, skip_special_tokens=True)[0].strip()
+
+            if answer.startswith("Assistant:"): answer = answer.replace("Assistant:", "").strip()
+
+            if not answer: # Basic check for empty answer
+                answer = "[MODEL_RETURNED_EMPTY]"
+                tqdm.write(f"Warning: Model returned empty answer for question '{question}'.")
+
+            conversation.append({"human": question, "assistant": answer})
+
+        except Exception as e:
+            tqdm.write(f"ERROR generating answer for question '{question}': {e}")
+            # Uncomment below for full traceback during debugging
+            # tqdm.write(traceback.format_exc())
+            conversation.append({
+                "human": question,
+                "assistant": "[ERROR_DURING_GENERATION]"
+            })
+
     return conversation
+# --- End generate_conversation_data ---
 
 
-
-
-def save_conversation_to_file(image, class_name, conversation, index, output_dir="llava_dataset"):
-    """Save the conversation data to a file in a format similar to LLaVA-Instruct-150k."""
-    # Create output directory if it doesn't exist
+# --- Function to save partial dataset ---
+def save_partial_dataset(output_dir, data_list, process_id):
+    """Saves the generated data list for a specific process."""
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Save the image
-    image_filename = f"{output_dir}/image_{index}_{class_name}.png"
-    image.save(image_filename)
-    
-    # Format the conversation data
-    conversation_data = {
-        "image": image_filename,
-        "class": class_name,
-        "conversations": conversation
-    }
-    
-    # Save as JSON
-    json_filename = f"{output_dir}/conversation_{index}_{class_name}.json"
-    with open(json_filename, 'w') as f:
-        json.dump(conversation_data, f, indent=2)
-    
-    return json_filename
+    filename = os.path.join(output_dir, f"dataset_part_{process_id}.json")
+    try:
+        with open(filename, 'w') as f:
+            json.dump(data_list, f, indent=2)
+        tqdm.write(f"Saved partial dataset checkpoint for process {process_id} to {filename} ({len(data_list)} items)")
+    except Exception as e:
+        tqdm.write(f"Error saving partial dataset {filename}: {e}")
+# --- End save_partial_dataset ---
 
-def display_image_with_descriptions(image, class_name, descriptions, save_path="output_image.png"):
-    """Display the image and its descriptions, with options for headless environments."""
-    # Save the image to a file
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    plt.title(f"Class: {class_name}")
-    plt.axis('off')
-    plt.savefig(save_path)
-    plt.close()  # Close the figure to free memory
-    
-    print(f"Image saved to {save_path}")
-    print(f"Image class: {class_name}")
-    print("\nImage Descriptions:")
-    for i, desc in enumerate(descriptions, 1):
-        if isinstance(desc, dict):
-            # If it's a dictionary with human/assistant keys
-            print(f"{i}. Human: {desc.get('human', '')}")
-            print(f"   Assistant: {desc.get('assistant', '')}")
-        else:
-            # If it's just a string
-            print(f"{i}. {desc}")
-        print("-" * 50)
 
-def save_dataset(output_dir, data_list, split_ratio=0.9):
-    """Save the dataset in a format suitable for training."""
-    # Create directories
-    os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
-    
-    # Shuffle data
-    random.shuffle(data_list)
-    
-    # Split into train/val
-    split_idx = int(len(data_list) * split_ratio)
-    train_data = data_list[:split_idx]
-    val_data = data_list[split_idx:]
-    
-    # Save train and val JSON files
-    with open(os.path.join(output_dir, "train.json"), 'w') as f:
-        json.dump(train_data, f, indent=2)
-    
-    with open(os.path.join(output_dir, "val.json"), 'w') as f:
-        json.dump(val_data, f, indent=2)
-    
-    # Create metadata
-    metadata = {
-        "dataset_name": "CIFAR10-VLM",
-        "num_images": len(data_list),
-        "num_train": len(train_data),
-        "num_val": len(val_data),
-        "classes": ["airplane", "automobile", "bird", "cat", "deer", 
-                   "dog", "frog", "horse", "ship", "truck"]
-    }
-    
-    with open(os.path.join(output_dir, "metadata.json"), 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    print(f"\nDataset saved to {output_dir}")
-    print(f"Train samples: {len(train_data)}")
-    print(f"Val samples: {len(val_data)}")
+# --- Main Execution Logic (Parallelized) ---
+def main(args):
+    print(f"Loading dataset: {args.dataset_name}...")
+    try: trainset, classes = download_dataset(args.dataset_name)
+    except ValueError as e: print(e); return
+    except Exception as e: print(f"Error loading dataset {args.dataset_name}: {e}"); return
 
-def main():
-    # Download CIFAR-10 and get a dataloader
-    print("Downloading CIFAR-10 dataset...")
-    trainloader, classes = download_cifar10()
-    
-    # Create output directory
-    output_dir = "cifar10_vlm_dataset"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Load the VLM model
-    print("Loading SmolVLM 2 model...")
-    model, processor = load_vlm_model()
-    print("Model loaded successfully!")
-    
-    # Store all data entries
-    all_data = []
-    
-    # Process CIFAR-10 images
-    num_images = 1000  # Aim for 1000+ images for a decent dataset
-    
-    # Create a tqdm progress bar
-    pbar = tqdm(range(num_images), desc="Processing CIFAR-10 images", unit="image")
-    
+    num_total_images = len(trainset)
+    print(f"Total training images in {args.dataset_name}: {num_total_images}"); print(f"Classes: {classes}")
+
+    # --- Determine Index Range for this Process ---
+    start_index = args.start_index; end_index = args.end_index
+    if start_index < 0: start_index = 0
+    if end_index is None or end_index > num_total_images: end_index = num_total_images
+    if start_index >= end_index: print(f"Start index {start_index} >= end index {end_index}. No images."); return
+    process_range = range(start_index, end_index)
+    # ---
+
+    num_images_to_process = len(process_range)
+    process_id = f"{args.dataset_name}_gpu{args.gpu_id}_{start_index}-{end_index-1}"
+    print(f"Process {process_id} (GPU: {args.gpu_id}) processing indices {start_index} to {end_index-1} ({num_images_to_process} images)")
+
+    # Setup Output Directories
+    output_dir = args.output_dir or f"./{args.dataset_name}_vlm_dataset_simple_parallel" # Adjusted default name
+    image_output_dir = os.path.join(output_dir, "images"); json_output_dir = os.path.join(output_dir, "json_parts")
+    os.makedirs(image_output_dir, exist_ok=True); os.makedirs(json_output_dir, exist_ok=True)
+    print(f"Output will be saved in: {output_dir}")
+
+    # Load VLM Model onto assigned GPU
+    print(f"Loading VLM model for process {process_id}...")
+    try: model, processor, device = load_vlm_model(args.gpu_id)
+    except Exception as e: print(f"FATAL: Failed to load model on GPU {args.gpu_id}: {e}"); return
+    print(f"Model loaded successfully for process {process_id} on {device}!")
+
+    process_data = []; saved_indices_count = 0
+    pbar = tqdm(process_range, desc=f"GPU {args.gpu_id} Processing", unit="image", mininterval=2.0)
+
+    # --- Main Processing Loop (Iterate through assigned indices) ---
     for i in pbar:
         try:
-            # Get a single image
-            image, label = load_single_image(trainloader)
-            class_name = classes[label]
-            
-            # Update progress bar description with current class
-            pbar.set_description(f"Processing {class_name} ({i+1}/{num_images})")
-            
-            # Generate conversation data (silently)
-            conversation = generate_conversation_data(model, processor, image, class_name)
-            
-            # Save image
-            image_filename = f"images/{class_name}_{i}.png"
-            image_path = os.path.join(output_dir, image_filename)
-            os.makedirs(os.path.dirname(image_path), exist_ok=True)
-            image.save(image_path)
-            
-            # Format for training
-            formatted_conversation = []
-            for entry in conversation:
-                formatted_conversation.append({"from": "human", "value": entry["human"]})
-                formatted_conversation.append({"from": "assistant", "value": entry["assistant"]})
-            
-            # Add to dataset
-            all_data.append({
-                "image": image_filename,
-                "conversations": formatted_conversation
-            })
-            
-            # Save progress every 10 images for testing, or 100 for production
-            if (i+1) % 100 == 0:
-                save_dataset(output_dir, all_data)
-                
-        except Exception as e:
-            # Log errors but continue processing
-            pbar.write(f"Error processing image {i}: {str(e)}")
-    
-    # Final save
-    save_dataset(output_dir, all_data)
-    print("Dataset generation complete!")
+            image_data, label = trainset[i]; class_name = classes[label]
+            if isinstance(image_data, torch.Tensor): pil_image = transforms.ToPILImage()(image_data)
+            elif isinstance(image_data, Image.Image): pil_image = image_data
+            else: tqdm.write(f"Warning: Unexpected type index {i}: {type(image_data)}. Skip."); continue
 
+            pbar.set_description(f"GPU {args.gpu_id} Proc {class_name} ({i})")
+
+            # Generate conversation using the simpler logic
+            conversation = generate_conversation_data(model, processor, pil_image, class_name, device) # Pass device
+
+            # --- Save Image and Format Output ---
+            if conversation and len(conversation) > 0: # Check if any turns were generated
+                if pil_image.mode != 'RGB': pil_image = pil_image.convert('RGB')
+                image_filename_base = f"{class_name.replace(' ', '_')}_{i}.png"
+                image_save_path = os.path.join(image_output_dir, image_filename_base)
+                pil_image.save(image_save_path)
+                image_relative_path = os.path.join("images", image_filename_base) # Relative path for JSON
+
+                # Format for LLaVA style
+                formatted_llava_style = []
+                for turn in conversation: # Include all generated turns
+                     human_val = turn.get("human"); assistant_val = turn.get("assistant")
+                     if human_val and assistant_val: # Check both keys exist
+                           formatted_llava_style.append({"from": "human", "value": human_val})
+                           formatted_llava_style.append({"from": "assistant", "value": assistant_val})
+
+                # Add to process data if formatted conversation is not empty
+                # No strict filtering applied here, assumes VLM output is usable
+                if formatted_llava_style:
+                    process_data.append({
+                        "image": image_relative_path,
+                        "conversations": formatted_llava_style,
+                        "original_index": i
+                    })
+
+        except KeyboardInterrupt: print(f"\nInterrupted by user on GPU {args.gpu_id}. Saving progress..."); break
+        except Exception as e: tqdm.write(f"CRITICAL Error processing image index {i}: {str(e)}\n{traceback.format_exc()}")
+
+        # --- Checkpointing Logic ---
+        items_processed_in_run = (i - start_index) + 1
+        if items_processed_in_run > 0 and items_processed_in_run % args.save_interval == 0:
+             if process_data:
+                 checkpoint_id = f"{process_id}_checkpoint_at_{i+1}"
+                 save_partial_dataset(json_output_dir, process_data, checkpoint_id)
+                 saved_indices_count += len(process_data); process_data = []
+
+    # --- Final Save ---
+    if process_data:
+        final_id = f"{process_id}_final"
+        save_partial_dataset(json_output_dir, process_data, final_id)
+        saved_indices_count += len(process_data)
+
+    print(f"Process {process_id} finished. Total conversations saved by this process: {saved_indices_count}")
+# --- End main ---
+
+
+# --- Argument Parser Setup ---
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Generate conversation dataset (simple version) in parallel using STL10 or CIFAR10.")
+    # --- Arguments for Parallelization and Dataset ---
+    parser.add_argument("--gpu_id", type=int, required=True, help="GPU ID (0, 1, 2, 3).")
+    parser.add_argument("--start_index", type=int, required=True, help="Starting index (inclusive).")
+    parser.add_argument("--end_index", type=int, required=True, help="Ending index (exclusive).")
+    parser.add_argument("--dataset_name", type=str, default="stl10", choices=['stl10', 'cifar10'], help="Dataset (stl10 or cifar10). Default: stl10")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory (defaults based on dataset name).")
+    parser.add_argument("--save_interval", type=int, default=200, help="Checkpoint save interval. Default: 200")
+
+    args = parser.parse_args()
+
+    # Basic validation
+    if args.start_index >= args.end_index or args.start_index < 0:
+         print(f"Error: Invalid index range --start_index {args.start_index} --end_index {args.end_index}")
+    else:
+         main(args)
+# --- End Script ---

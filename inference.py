@@ -26,7 +26,7 @@ def load_models_for_inference(phi_model_name, siglip_model_name, projection_chec
     print(f"Loading base Phi-3 model: {phi_model_name} with quantization...")
     phi_model = AutoModelForCausalLM.from_pretrained(
         phi_model_name,
-        quantization_config=quant_config,
+        #quantization_config=quant_config,
         torch_dtype=compute_dtype,
         device_map="auto",
         trust_remote_code=True
@@ -38,8 +38,8 @@ def load_models_for_inference(phi_model_name, siglip_model_name, projection_chec
         phi_model.config.pad_token_id = phi_tokenizer.pad_token_id
 
     print(f"Loading QLoRA adapter from: {adapter_checkpoint_path}...")
-    model_with_adapter = PeftModel.from_pretrained(phi_model, adapter_checkpoint_path)
-    model_with_adapter.eval()
+    #model_with_adapter = PeftModel.from_pretrained(phi_model, adapter_checkpoint_path)
+    #model_with_adapter.eval()
     print("Phi-3 model with QLoRA adapter loaded.")
 
     print(f"Loading SigLIP projection model from: {projection_checkpoint_path}...")
@@ -155,7 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--projection_dim", type=int, default=PROJECTION_CONFIG["PROJECTION_DIM"], help="Projection dimension")
     parser.add_argument("--projection_layers", type=int, default=PROJECTION_CONFIG["PROJECTION_LAYERS"], help="Number of layers in projection MLP")
     parser.add_argument("--image_path", type=str, required=True, help="Path to the input image")
-    parser.add_argument("--max_length", type=int, default=200, help="Maximum length for generated text")
+    parser.add_argument("--max_length", type=int, default=512, help="Maximum length for generated text")
     parser.add_argument("--prompt", type=str, default="What is the object in the image? Describe it in detail.", help="Prompt to guide image description generation")
     args = parser.parse_args()
     main(args)

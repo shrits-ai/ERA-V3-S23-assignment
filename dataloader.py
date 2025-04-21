@@ -11,8 +11,8 @@ CONFIG = {
     # Dataset parameters
     "IMAGE_SIZE": 384,  # SigLIP input size
     "MAX_LENGTH": 512,  # Maximum sequence length for text
-    "NORMALIZE_MEAN": [0.4914, 0.4822, 0.4465],  # CIFAR-10 normalization mean
-    "NORMALIZE_STD": [0.2470, 0.2435, 0.2616],   # CIFAR-10 normalization std
+    "NORMALIZE_MEAN": [0.4467, 0.4398, 0.4066],  # STL-10 normalization mean
+    "NORMALIZE_STD": [0.2241, 0.2215, 0.2239],   # STL-10 normalization std
     
     # Dataloader parameters
     "BATCH_SIZE": 8,
@@ -139,7 +139,7 @@ def create_dataloaders(data_dir, phi_processor_name, batch_size=CONFIG["BATCH_SI
 
 if __name__ == "__main__":
     # Test the dataloader
-    data_dir = "cifar10_vlm_dataset"
+    data_dir = "stl10_vlm_dataset_final"
     phi_processor_name = "microsoft/phi-3-mini-4k-instruct"
     
     train_loader, val_loader = create_dataloaders(

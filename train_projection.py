@@ -1,4 +1,9 @@
 import os
+HF_CACHE_PATH = "/opt/dlami/nvme/huggingface_cache"
+os.makedirs(HF_CACHE_PATH, exist_ok=True)
+os.environ['HF_HOME'] = HF_CACHE_PATH
+os.environ['HF_DATASETS_CACHE'] = os.path.join(HF_CACHE_PATH, 'datasets')
+os.environ['TRANSFORMERS_CACHE'] = os.path.join(HF_CACHE_PATH, 'transformers')
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -24,8 +29,8 @@ CONFIG = {
     "BATCH_SIZE": 16,
     "LEARNING_RATE": 1e-4,
     "WEIGHT_DECAY": 0.01,
-    "EPOCHS": 30,
-    "SAVE_EVERY": 1,
+    "EPOCHS": 10,
+    "SAVE_EVERY": 5,
     
     # Optimizer parameters
     "OPTIMIZER": "adamw",
@@ -39,7 +44,7 @@ CONFIG = {
     "USE_MIXED_PRECISION": True,
     
     # Data parameters
-    "DATA_DIR": "cifar10_vlm_dataset",
+    "DATA_DIR": "stl10_vlm_dataset_final",
     "NUM_WORKERS": 4,
     
     # Output parameters
@@ -444,7 +449,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="cifar10_vlm_dataset",
+        default="stl10_vlm_dataset_final",
         help="Directory containing the dataset (with train.json/val.json)"
     )
     parser.add_argument(
@@ -498,13 +503,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs",
         type=int,
-        default=30,
+        default=10,
         help="Number of training epochs"
     )
     parser.add_argument(
         "--save_every",
         type=int,
-        default=1,
+        default=5,
         help="Save checkpoint every N epochs"
     )
     parser.add_argument(

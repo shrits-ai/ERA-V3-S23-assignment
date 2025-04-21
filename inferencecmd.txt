@@ -1,0 +1,1 @@
+python3 inference.py     --projection_model_path ./siglip_phi3_projection/best_model.pt     --adapter_checkpoint_path ./phi3_qlora_adapter/final_model/     --image_path ./cifar10_vlm_dataset/images/horse_345.png     --prompt "What is the object in the image? Describe it in detail."
